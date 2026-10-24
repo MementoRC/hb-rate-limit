@@ -24,7 +24,6 @@ from rate_limit.backoff import (
     PauseState,
     RateLimitExceededError,
     RateLimitVerdict,
-    wait_until,
 )
 from rate_limit.errors import (
     RateLimitPoolConflictError,
@@ -77,6 +76,7 @@ class RateLimiter:
         self._backoff_factory = backoff_factory
         self._unknown_mode = unknown
         self._lock = threading.Lock()
+        self._report_lock = threading.Lock()
         self._raw: dict[str, RateLimit] = {}
         self._scaled: dict[str, RateLimit] = {}
         self._owners: dict[str, str | None] = {}
@@ -115,7 +115,15 @@ class RateLimiter:
                 if known is None:
                     pending[raw.limit_id] = raw
                 elif known != raw:
-                    existing_owner = self._owners.get(raw.limit_id, owner)
+                    existing_owner: str | None
+                    if raw.limit_id in pending:
+                        existing_owner = (
+                            f"{owner}, earlier in the same batch"
+                            if owner
+                            else "earlier in the same batch"
+                        )
+                    else:
+                        existing_owner = self._owners.get(raw.limit_id)
                     raise RateLimitPoolConflictError(
                         raw.limit_id, known, raw, existing_owner, owner
                     )
@@ -243,19 +251,29 @@ class RateLimiter:
 
     def _try_reserve(
         self, limit_id: str, weights: Mapping[str, int] | None, deadline: float, record: bool
-    ) -> tuple[float, float]:
-        """One synchronous check-and-record step. Returns ``(wait, now)``; never awaits."""
+    ) -> tuple[float, float, bool]:
+        """One synchronous pause-check-and-record step; never awaits.
+
+        Returns ``(wait, now, paused)``. When recording, an active pause short-circuits
+        before the window is touched (``paused=True``, nothing recorded); unknown ids in
+        "allow" mode skip the window but still honour pauses.
+        """
+        warnings: list[str] = []
         with self._lock:
             now = self._clock()
             plan = self._plan(limit_id, weights)
-            if plan is None:
-                return 0.0, now
-            through = deadline if now >= deadline else -math.inf
-            wait = self._assess(plan, now, through, record)
-            warnings = self._near_capacity(plan, now) if record and wait == 0.0 else []
+            pause_wait = max(0.0, self._paused_until_locked(limit_id) - now)
+            if record and pause_wait > 0.0:
+                return pause_wait, now, True
+            window_wait = 0.0
+            if plan is not None:
+                through = deadline if now >= deadline else -math.inf
+                window_wait = self._assess(plan, now, through, record)
+                if record and window_wait == 0.0:
+                    warnings = self._near_capacity(plan, now)
         for message in warnings:
             logger.warning(message)
-        return wait, now
+        return max(pause_wait, window_wait), now, False
 
     # ---- acquire --------------------------------------------------------------------
 
@@ -264,15 +282,13 @@ class RateLimiter:
 
         Sleeps happen outside every lock; cancelling records nothing.
         """
-        if not self._validate(limit_id, weights):
-            return
         deadline = -math.inf
         while True:
-            await wait_until(lambda: self.paused_until(limit_id), self._clock, self._sleep)
-            wait, now = self._try_reserve(limit_id, weights, deadline, record=True)
+            wait, now, paused = self._try_reserve(limit_id, weights, deadline, record=True)
             if wait == 0.0:
                 return
-            deadline = now + wait
+            if not paused:
+                deadline = now + wait
             await self._sleep(wait)
 
     def execute_task(
@@ -284,20 +300,11 @@ class RateLimiter:
 
     def try_acquire(self, limit_id: str, weights: Mapping[str, int] | None = None) -> float:
         """Non-blocking: 0.0 = reserved, else seconds to wait (nothing recorded)."""
-        if not self._validate(limit_id, weights):
-            return 0.0
-        pause_wait = self.paused_until(limit_id) - self._clock()
-        if pause_wait > 0:
-            return pause_wait
         return self._try_reserve(limit_id, weights, -math.inf, record=True)[0]
 
     def blocked_for(self, limit_id: str, weights: Mapping[str, int] | None = None) -> float:
         """Seconds until an acquire would pass (pause or window); records nothing."""
-        if not self._validate(limit_id, weights):
-            return 0.0
-        pause_wait = max(0.0, self.paused_until(limit_id) - self._clock())
-        window_wait = self._try_reserve(limit_id, weights, -math.inf, record=False)[0]
-        return max(pause_wait, window_wait)
+        return self._try_reserve(limit_id, weights, -math.inf, record=False)[0]
 
     def bind(self, limit_id: str, weights: Mapping[str, int] | None = None) -> BoundLimiter:
         """A single-limit view satisfying the pausable limiter protocols."""
@@ -329,15 +336,18 @@ class RateLimiter:
         with self._lock:
             self._pause_all_until = max(self._pause_all_until, until)
 
+    def _paused_until_locked(self, limit_id: str) -> float:
+        ids = {limit_id}
+        primary = self._scaled.get(limit_id)
+        if primary is not None:
+            ids.update(pair.limit_id for pair in primary.linked_limits)
+        deadlines = (self._states[i].deadline for i in ids if i in self._states)
+        return max([self._pause_all_until, *deadlines])
+
     def paused_until(self, limit_id: str) -> float:
         """Clock value the pause on ``limit_id`` (or a linked id) lasts to; 0.0 if never."""
         with self._lock:
-            ids = {limit_id}
-            primary = self._scaled.get(limit_id)
-            if primary is not None:
-                ids.update(pair.limit_id for pair in primary.linked_limits)
-            deadlines = (self._states[i].deadline for i in ids if i in self._states)
-            return max([self._pause_all_until, *deadlines])
+            return self._paused_until_locked(limit_id)
 
     def is_paused(self, limit_id: str) -> bool:
         return self.paused_until(limit_id) > self._clock()
@@ -352,16 +362,17 @@ class RateLimiter:
     ) -> RateLimitVerdict:
         """Apply the backoff policy to a rate-limit signal (``status=None`` counts as 429)."""
         effective = 429 if status is None else status
-        in_burst = self.is_paused(limit_id)
-        delay = self.backoff(limit_id).next_delay(effective, retry_after, in_burst)
-        if delay == 0.0 and in_burst:
-            logger.debug("Rate limit signal on %r joins the active pause", limit_id)
-            return RateLimitVerdict(True, effective, retry_after, 0.0, False)
-        paused_all = effective == 418
-        if paused_all:
-            self.pause_all(delay)
-        else:
-            self.pause(limit_id, delay)
+        with self._report_lock:  # one burst-check/escalate/pause step at a time
+            in_burst = self.is_paused(limit_id)
+            delay = self.backoff(limit_id).next_delay(effective, retry_after, in_burst)
+            if delay == 0.0 and in_burst:
+                logger.debug("Rate limit signal on %r joins the active pause", limit_id)
+                return RateLimitVerdict(True, effective, retry_after, 0.0, False)
+            paused_all = effective == 418
+            if paused_all:
+                self.pause_all(delay)
+            else:
+                self.pause(limit_id, delay)
         note = (
             " (unusually long Retry-After, honoured)"
             if retry_after is not None and retry_after > LONG_RETRY_AFTER_WARN_SECONDS

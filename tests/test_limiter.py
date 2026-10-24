@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
 import pytest
@@ -124,6 +126,14 @@ class TestRegistry:
         assert not rl.has_limit("a")
         rl.add_limits([RateLimit("a", 1, 1), RateLimit("a", 1, 1)])
         assert rl.has_limit("a")
+
+    def test_same_batch_conflict_names_the_batch_not_a_phantom_owner(
+        self, clock: ManualClock
+    ) -> None:
+        rl = make(clock)
+        with pytest.raises(RateLimitPoolConflictError) as excinfo:
+            rl.add_limits([RateLimit("a", 1, 1), RateLimit("a", 2, 1)], owner="o")
+        assert "earlier in the same batch" in str(excinfo.value)
 
     async def test_set_limits_keeps_history_only_for_unchanged(self, clock: ManualClock) -> None:
         rl = make(clock, RateLimit("keep", 1, 10), RateLimit("change", 1, 10))
@@ -333,6 +343,27 @@ class TestUnknown:
         assert rl.try_acquire("nope") == 0.0
         assert rl.blocked_for("nope") == 0.0
 
+    @pytest.fixture(params=["pause_all", "pause_id"])
+    def paused_unknown(self, clock: ManualClock, request: pytest.FixtureRequest) -> RateLimiter:
+        rl = make(clock, unknown="allow")
+        if request.param == "pause_all":
+            rl.pause_all(7)
+        else:
+            rl.pause("nope", 7)
+        return rl
+
+    async def test_allow_mode_acquire_waits_out_pause(
+        self, paused_unknown: RateLimiter, clock: ManualClock
+    ) -> None:
+        await paused_unknown.acquire("nope")
+        assert clock.sleeps == [pytest.approx(7.0)]
+
+    def test_allow_mode_try_acquire_reports_pause(self, paused_unknown: RateLimiter) -> None:
+        assert paused_unknown.try_acquire("nope") == pytest.approx(7.0)
+
+    def test_allow_mode_blocked_for_reports_pause(self, paused_unknown: RateLimiter) -> None:
+        assert paused_unknown.blocked_for("nope") == pytest.approx(7.0)
+
     async def test_linked_unknown_follows_mode(
         self, clock: ManualClock, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -482,6 +513,7 @@ class TestMustInvariants:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+        assert rl._pools["a"].used == 1  # nothing recorded before the sleep
         clock.advance(10.001)
         assert rl.try_acquire("a") == 0.0  # only the first charge existed, and it expired
         assert rl.try_acquire("a") == pytest.approx(10.0)  # exactly one charge since
@@ -582,6 +614,21 @@ class TestBackoffHooks:
         clock.advance(5)
         assert rl.report_throttled("a").delay == 10.0
         assert rl.backoff("a").streak == 2
+
+    def test_concurrent_reports_escalate_once(self, clock: ManualClock) -> None:
+        class Slow(BackoffPolicy):
+            def next_delay(
+                self, status: int, retry_after: float | None, in_burst: bool = False
+            ) -> float:
+                time.sleep(0.02)  # widen the check-then-act window
+                return super().next_delay(status, retry_after, in_burst)
+
+        rl = make(clock, RateLimit("a", 5, 1), backoff_factory=Slow)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            verdicts = list(pool.map(lambda _: rl.report_throttled("a"), range(8)))
+        assert sorted(v.delay for v in verdicts) == [0.0] * 7 + [5.0]
+        assert rl.backoff("a").streak == 1
+        assert rl.paused_until("a") == pytest.approx(1005.0)
 
     def test_report_throttled_418_pauses_all(self, clock: ManualClock) -> None:
         rl = make(clock, RateLimit("a", 5, 1), RateLimit("b", 5, 1))

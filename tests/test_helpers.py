@@ -98,6 +98,15 @@ class TestRunPaced:
         assert clock() - before == pytest.approx(120.0, abs=0.01)
 
 
+class TestBoundLimiterDelegation:
+    def test_418_on_bound_limiter_pauses_all_limits(self, clock: ManualClock) -> None:
+        rl = RateLimiter(
+            [RateLimit("a", 10, 1), RateLimit("b", 10, 1)], clock=clock, sleep=clock.sleep
+        )
+        note_rate_limited(rl.bind("a"), RateLimitExceededError(status=418))
+        assert rl.is_paused("b")
+
+
 class TestUnpausableLimiter:
     class AcquireOnly:
         async def acquire(self) -> None:

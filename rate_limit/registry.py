@@ -44,6 +44,7 @@ def get_pool_limiter(
     non-reversible tag (never the API key itself) when keying by credentials.
 
     :raises RateLimitPoolConflictError: the pool exists with a different raw definition
+    :raises ValueError: creating a pool from a limit that has linked limits
     """
     given = coerce_limit(limit)
     requested = RateLimit(
@@ -52,6 +53,10 @@ def get_pool_limiter(
     with _REGISTRY_LOCK:
         entry = _LIMITERS.get(pool_key)
         if entry is None:
+            if requested.linked_limits:
+                raise ValueError(
+                    f"pool limiters are single-limit: {pool_key!r} cannot declare linked limits"
+                )
             limiter = RateLimiter(
                 [requested],
                 clock=clock,

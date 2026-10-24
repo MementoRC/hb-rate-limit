@@ -13,6 +13,7 @@ from rate_limit.backoff import (
     wait_out_deadline,
     wait_until,
 )
+from rate_limit.limiter import BoundLimiter
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -60,6 +61,9 @@ def note_rate_limited(limiter: RestRateLimiterProtocol, exc: RateLimitExceededEr
     Limiters without ``pause()`` cannot back off: that is logged once and nothing else
     happens (the caller re-raises the error).
     """
+    if isinstance(limiter, BoundLimiter):
+        limiter.limiter.report_rate_limited(limiter.limit_id, exc)  # 418 pauses every limit
+        return
     status = 429 if exc.status is None else exc.status
     pause = getattr(limiter, "pause", None)
     if not callable(pause):

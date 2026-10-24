@@ -83,6 +83,12 @@ def test_raw_mismatch_raises_and_names_owner(other: RateLimit) -> None:
     assert "second" in str(excinfo.value)
 
 
+def test_linked_limits_rejected_at_creation() -> None:
+    linked = RateLimit("x", 1, 10, linked_limits=[LinkedLimitWeightPair("y")])
+    with pytest.raises(ValueError, match="single-limit"):
+        get_pool_limiter("p", linked)
+
+
 def test_identical_raw_readd_is_noop() -> None:
     first = get_pool_limiter("p", RateLimit("x", 1, 10), owner="first")
     again = get_pool_limiter("p", RateLimit("y", 1, 10), owner="second")
