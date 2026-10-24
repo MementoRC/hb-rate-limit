@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ class _Entry:
     limiter: RateLimiter
     raw: RateLimit
     owner: str | None
+    margin: float
 
 
 _LIMITERS: dict[str, _Entry] = {}
@@ -37,6 +39,7 @@ def get_pool_limiter(
     wall_clock: Callable[[], float] = time.time,
     owner: str | None = None,
     backoff_factory: Callable[[], BackoffPolicy] | None = None,
+    safety_margin_pct: float = 0.0,
 ) -> BoundLimiter:
     """Return the process-wide limiter for ``pool_key``, creating it on first use.
 
@@ -44,9 +47,15 @@ def get_pool_limiter(
     limit takes ``pool_key`` as its ``limit_id``. Callers sharing a budget pass the same key; use a
     non-reversible tag (never the API key itself) when keying by credentials.
 
-    :raises RateLimitPoolConflictError: the pool exists with a different raw definition
-    :raises ValueError: creating a pool from a limit that has linked limits
+    ``safety_margin_pct`` (default 0.0) widens the pool like :class:`RateLimiter`'s and is part
+    of the pool's identity. hb_compat shims pass 0.05 for parity with hummingbot's
+    ``AsyncThrottlerBase``.
+
+    :raises RateLimitPoolConflictError: the pool exists with a different raw definition or margin
+    :raises ValueError: creating a pool from a limit that has linked limits, or a bad margin
     """
+    if not math.isfinite(safety_margin_pct) or safety_margin_pct < 0:
+        raise ValueError(f"safety_margin_pct must be finite and >= 0, got {safety_margin_pct!r}")
     given = coerce_limit(limit)
     requested = RateLimit(
         pool_key,
@@ -69,10 +78,22 @@ def get_pool_limiter(
                 sleep=sleep,
                 wall_clock=wall_clock,
                 backoff_factory=backoff_factory or BackoffPolicy,
+                safety_margin_pct=safety_margin_pct,
             )
-            entry = _LIMITERS[pool_key] = _Entry(limiter, requested, owner)
-        elif entry.raw != requested:
-            raise RateLimitPoolConflictError(pool_key, entry.raw, requested, entry.owner, owner)
+            entry = _LIMITERS[pool_key] = _Entry(limiter, requested, owner, safety_margin_pct)
+        elif entry.raw != requested or entry.margin != safety_margin_pct:
+            raise RateLimitPoolConflictError(
+                pool_key,
+                entry.raw,
+                requested,
+                entry.owner,
+                owner,
+                detail=(
+                    f"Margins differ: safety_margin_pct {entry.margin} vs {safety_margin_pct}. "
+                    if entry.margin != safety_margin_pct
+                    else ""
+                ),
+            )
     return entry.limiter.bind(pool_key)
 
 
