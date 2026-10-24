@@ -91,12 +91,16 @@ class RateLimitExceededError(Exception):
 
     @classmethod
     def from_response(
-        cls, status: int, headers: Mapping[str, str] | None = None, message: str = ""
+        cls,
+        status: int,
+        headers: Mapping[str, str] | None = None,
+        message: str = "",
+        *,
+        now: Callable[[], float] = time.time,
     ) -> Self:
-        """Build the error from a response status and its headers."""
-        return cls(
-            message, status=status, retry_after=parse_retry_after(_header(headers, "Retry-After"))
-        )
+        """Build the error from a response status and its headers (``now``: wall clock)."""
+        retry_after = parse_retry_after(_header(headers, "Retry-After"), now=now)
+        return cls(message, status=status, retry_after=retry_after)
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,6 @@
 from collections.abc import Iterator
+from datetime import UTC, datetime
+from email.utils import format_datetime
 
 import pytest
 
@@ -56,6 +58,17 @@ def test_first_caller_wins_clock_and_backoff(clock: ManualClock) -> None:
     first.pause(1)
     assert first.limiter.paused_until("p") == pytest.approx(1001.0)
     assert first.backoff.next_delay(429, None) == 7
+
+
+def test_first_caller_wins_wall_clock(clock: ManualClock) -> None:
+    wall = datetime(2030, 1, 1, tzinfo=UTC).timestamp()
+    header = format_datetime(datetime.fromtimestamp(wall + 30, UTC), usegmt=True)
+    first = get_pool_limiter(
+        "p", RateLimit("x", 1, 1), clock=clock, sleep=clock.sleep, wall_clock=lambda: wall
+    )
+    get_pool_limiter("p", RateLimit("x", 1, 1), wall_clock=lambda: wall + 1000)
+    verdict = first.limiter.report_response("p", 429, {"Retry-After": header})
+    assert verdict.retry_after == pytest.approx(30.0)
 
 
 def test_pools_are_isolated_by_key(clock: ManualClock) -> None:

@@ -1,9 +1,12 @@
 import asyncio
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from decimal import Decimal
+from email.utils import format_datetime
 
 import pytest
 
@@ -135,7 +138,9 @@ class TestRegistry:
             rl.add_limits([RateLimit("a", 1, 1), RateLimit("a", 2, 1)], owner="o")
         assert "earlier in the same batch" in str(excinfo.value)
 
-    async def test_set_limits_keeps_history_only_for_unchanged(self, clock: ManualClock) -> None:
+    async def test_set_limits_keeps_history_and_starts_new_ids_empty(
+        self, clock: ManualClock
+    ) -> None:
         rl = make(clock, RateLimit("keep", 1, 10), RateLimit("change", 1, 10))
         await rl.acquire("keep")
         await rl.acquire("change")
@@ -144,10 +149,46 @@ class TestRegistry:
         )
         assert not rl.has_limit("zzz")
         assert rl.try_acquire("keep") > 0  # history kept
-        assert rl.try_acquire("change") == 0.0  # fresh pool
+        assert rl.try_acquire("change") == 0.0  # 1 used of 2: still fits
         assert rl.try_acquire("new") == 0.0
         rl.set_limits([RateLimit("only", 1, 1)])
         assert not rl.has_limit("keep")
+
+
+class TestSetLimitsHistory:
+    async def test_limit_decrease_keeps_used_history(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 10, 10))
+        await rl.acquire("a", {"a": 8})
+        rl.set_limits([RateLimit("a", 5, 10)])
+        assert rl.try_acquire("a") == pytest.approx(10.0)  # not a fresh window
+
+    async def test_interval_change_evicts_per_new_window(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        await rl.acquire("a")
+        clock.advance(15)
+        rl.set_limits([RateLimit("a", 1, 20)])
+        assert rl.try_acquire("a") == pytest.approx(5.0)  # entry still inside the 20s window
+        clock.advance(6)
+        assert rl.try_acquire("a") == 0.0
+        rl.set_limits([RateLimit("a", 1, 5)])
+        clock.advance(6)
+        assert rl.try_acquire("a") == 0.0  # shrunk window drops the aged entry
+
+    async def test_weight_and_linked_change_keep_history(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 2, 10))
+        await rl.acquire("a")
+        rl.set_limits([RateLimit("a", 2, 10, weight=2)])
+        assert rl.try_acquire("a") > 0
+        linked = RateLimit("a", 1, 10, linked_limits=[LinkedLimitWeightPair("b")])
+        rl.set_limits([linked, RateLimit("b", 5, 10)])
+        assert rl.try_acquire("a") > 0
+
+    async def test_removed_then_readded_id_starts_empty(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        await rl.acquire("a")
+        rl.set_limits([RateLimit("b", 1, 10)])
+        rl.set_limits([RateLimit("a", 1, 10)])
+        assert rl.try_acquire("a") == 0.0
 
 
 class TestAcquireWindow:
@@ -363,6 +404,41 @@ class TestUnknown:
 
     def test_allow_mode_blocked_for_reports_pause(self, paused_unknown: RateLimiter) -> None:
         assert paused_unknown.blocked_for("nope") == pytest.approx(7.0)
+
+    @pytest.mark.parametrize("weights", [{"ghost": 1}, {"registered": 1}, {"nope": 0}])
+    async def test_allow_mode_still_validates_weights(
+        self, clock: ManualClock, weights: dict[str, int]
+    ) -> None:
+        rl = make(clock, RateLimit("registered", 5, 1), unknown="allow")
+        with pytest.raises(ValueError):
+            await rl.acquire("nope", weights)
+        with pytest.raises(ValueError):
+            rl.execute_task("nope", weights=weights)
+
+    async def test_allow_mode_accepts_valid_weight_on_the_unknown_primary(
+        self, clock: ManualClock
+    ) -> None:
+        rl = make(clock, unknown="allow")
+        await rl.acquire("nope", {"nope": 3})
+        assert clock.sleeps == []
+
+    async def test_unknown_warning_is_emitted_without_the_lock(self, clock: ManualClock) -> None:
+        rl = make(clock, unknown="allow")
+        held: list[bool] = []
+
+        class Probe(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                held.append(rl._lock.locked())
+
+        handler = Probe(logging.WARNING)
+        target = logging.getLogger("rate_limit.limiter")
+        target.addHandler(handler)
+        try:
+            await rl.acquire("nope")
+            rl.execute_task("nope2")
+        finally:
+            target.removeHandler(handler)
+        assert held == [False, False]
 
     async def test_linked_unknown_follows_mode(
         self, clock: ManualClock, caplog: pytest.LogCaptureFixture
@@ -683,6 +759,33 @@ class TestBackoffHooks:
         rl.report_response("a", 204)
         assert rl.backoff("a").streak == 0
         rl.report_success("never-seen")  # no state, no error
+
+    def test_negative_retry_after_clamps_to_zero(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 5, 1))
+        verdict = rl.report_throttled("a", -5.0)
+        assert (verdict.delay, verdict.retry_after) == (0.0, 0.0)
+        assert not rl.is_paused("a")
+
+    @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+    def test_non_finite_retry_after_is_rejected_before_the_streak(
+        self, clock: ManualClock, bad: float
+    ) -> None:
+        rl = make(clock, RateLimit("a", 5, 1))
+        with pytest.raises(ValueError, match="retry_after"):
+            rl.report_throttled("a", bad)
+        assert rl.backoff("a").streak == 0
+        assert not rl.is_paused("a")
+        assert not rl._report_lock.locked()
+
+    def test_http_date_uses_wall_clock_not_the_limiter_clock(self, clock: ManualClock) -> None:
+        wall = datetime(2030, 1, 1, tzinfo=UTC).timestamp()
+        rl = RateLimiter(
+            [RateLimit("a", 5, 1)], clock=clock, sleep=clock.sleep, wall_clock=lambda: wall
+        )
+        header = format_datetime(datetime.fromtimestamp(wall + 30, UTC), usegmt=True)
+        verdict = rl.report_response("a", 429, {"Retry-After": header})
+        assert verdict.retry_after == pytest.approx(30.0)
+        assert verdict.delay == pytest.approx(30.0)
 
     def test_fixed_backoff_via_factory(self, clock: ManualClock) -> None:
         rl = make(clock, RateLimit("a", 5, 1), backoff_factory=lambda: BackoffPolicy.fixed(63))

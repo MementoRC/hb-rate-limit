@@ -29,8 +29,9 @@ class ManualClock:
         self.now += seconds
 
     async def sleep(self, seconds: float) -> None:
+        start = self.now
         self.sleeps.append(seconds)
         if self.on_sleep is not None:
             self.on_sleep(seconds)
-        self.now += seconds
         await asyncio.sleep(0)  # yield so concurrent waiters interleave
+        self.now = max(self.now, start + seconds)  # concurrent sleepers overlap, not sum

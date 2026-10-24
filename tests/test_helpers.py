@@ -8,6 +8,7 @@ from rate_limit import (
     RateLimit,
     RateLimiter,
     RateLimitExceededError,
+    helpers,
     note_rate_limited,
     note_request_succeeded,
     run_paced,
@@ -131,7 +132,10 @@ class TestUnpausableLimiter:
         note_rate_limited(limiter, RateLimitExceededError(status=429))
         note_request_succeeded(limiter)
 
-    def test_fallback_policy_is_remembered_and_reset(self) -> None:
+    def test_fallback_policy_is_remembered_and_reset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        now = [0.0]
+        monkeypatch.setattr(helpers, "_CLOCK", lambda: now[0])
+
         class Pausable:
             def __init__(self) -> None:
                 self.paused: list[float] = []
@@ -144,11 +148,53 @@ class TestUnpausableLimiter:
 
         limiter = Pausable()
         note_rate_limited(limiter, RateLimitExceededError(status=429))
+        now[0] = 6.0
         note_rate_limited(limiter, RateLimitExceededError(status=429))
         assert limiter.paused == [5.0, 10.0]
         note_request_succeeded(limiter)
+        now[0] = 100.0
         note_rate_limited(limiter, RateLimitExceededError(status=None))
         assert limiter.paused[-1] == 5.0
+
+    async def test_pause_only_limiter_burst_escalates_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class PauseOnly:
+            def __init__(self) -> None:
+                self.paused: list[float] = []
+
+            async def acquire(self) -> None:
+                return None
+
+            def pause(self, seconds: float) -> None:
+                self.paused.append(seconds)
+
+        now = [100.0]
+        monkeypatch.setattr(helpers, "_CLOCK", lambda: now[0])
+        limiter = PauseOnly()
+        error = RateLimitExceededError(status=429)
+        await asyncio.gather(
+            *(run_paced(limiter, failing(error)) for _ in range(5)), return_exceptions=True
+        )
+        assert limiter.paused == [5.0]
+        now[0] = 106.0  # the helper-set pause has ended: a new signal escalates
+        note_rate_limited(limiter, error)
+        assert limiter.paused == [5.0, 10.0]
+
+    def test_non_weakrefable_unpausable_limiter_still_warns_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class Slotted:
+            __slots__ = ()
+
+            async def acquire(self) -> None:
+                return None
+
+        limiter = Slotted()
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                note_rate_limited(limiter, RateLimitExceededError(status=429))
+        assert len([r for r in caplog.records if "cannot pause" in r.getMessage()]) == 1
 
     def test_limiter_label_falls_back_to_type_name(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.WARNING):

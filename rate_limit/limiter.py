@@ -56,6 +56,7 @@ class RateLimiter:
         safety_margin_pct: float = 0.0,
         clock: Clock = time.monotonic,
         sleep: Sleep = asyncio.sleep,
+        wall_clock: Callable[[], float] = time.time,
         backoff_factory: Callable[[], BackoffPolicy] = BackoffPolicy,
         unknown: Literal["raise", "allow"] = "raise",
     ) -> None:
@@ -73,6 +74,7 @@ class RateLimiter:
         self._margin = safety_margin_pct
         self._clock = clock
         self._sleep = sleep
+        self._wall_clock = wall_clock  # only for HTTP-date Retry-After; ``clock`` may be monotonic
         self._backoff_factory = backoff_factory
         self._unknown_mode = unknown
         self._lock = threading.Lock()
@@ -97,8 +99,8 @@ class RateLimiter:
     def add_limit(self, limit: RateLimitLike, *, owner: str | None = None) -> RateLimit:
         """Register one limit; returns the stored (scaled) limit."""
         raw = coerce_limit(limit)
-        self.add_limits([raw], owner=owner)
         with self._lock:
+            self._add_locked([raw], owner)
             return self._scaled[raw.limit_id]
 
     def add_limits(self, limits: Iterable[RateLimitLike], *, owner: str | None = None) -> None:
@@ -109,37 +111,45 @@ class RateLimiter:
         """
         incoming = [coerce_limit(item) for item in limits]
         with self._lock:
-            pending: dict[str, RateLimit] = {}
-            for raw in incoming:
-                known = pending.get(raw.limit_id) or self._raw.get(raw.limit_id)
-                if known is None:
-                    pending[raw.limit_id] = raw
-                elif known != raw:
-                    existing_owner: str | None
-                    if raw.limit_id in pending:
-                        existing_owner = (
-                            f"{owner}, earlier in the same batch"
-                            if owner
-                            else "earlier in the same batch"
-                        )
-                    else:
-                        existing_owner = self._owners.get(raw.limit_id)
-                    raise RateLimitPoolConflictError(
-                        raw.limit_id, known, raw, existing_owner, owner
-                    )
-            for raw in pending.values():
-                self._install(raw, owner)
+            self._add_locked(incoming, owner)
+
+    def _add_locked(self, incoming: list[RateLimit], owner: str | None) -> None:
+        pending: dict[str, RateLimit] = {}
+        for raw in incoming:
+            known = pending.get(raw.limit_id) or self._raw.get(raw.limit_id)
+            if known is None:
+                pending[raw.limit_id] = raw
+            elif known != raw:
+                existing_owner: str | None
+                if raw.limit_id in pending:
+                    batch = "earlier in the same batch"
+                    existing_owner = f"{owner}, {batch}" if owner else batch
+                else:
+                    existing_owner = self._owners.get(raw.limit_id)
+                raise RateLimitPoolConflictError(raw.limit_id, known, raw, existing_owner, owner)
+        for raw in pending.values():
+            self._install(raw, owner)
 
     def set_limits(self, limits: Iterable[RateLimitLike]) -> None:
-        """Replace all definitions; history is kept only for unchanged scaled definitions."""
+        """Replace all definitions; history carries over for every retained id.
+
+        The window holds traffic the venue already counted, so it stays valid under a new
+        limit, interval, weight or link; it is dropped only when an id is removed.
+        """
         incoming = {raw.limit_id: raw for raw in map(coerce_limit, limits)}
         with self._lock:
+            now = self._clock()
             old_scaled, old_pools, old_owners = self._scaled, self._pools, self._owners
             self._raw, self._scaled, self._pools, self._owners = {}, {}, {}, {}
             for limit_id, raw in incoming.items():
                 self._install(raw, None)
-                if old_scaled.get(limit_id) == self._scaled[limit_id]:
-                    self._pools[limit_id] = old_pools[limit_id]
+                scaled = self._scaled[limit_id]
+                old_pool = old_pools.get(limit_id)
+                if isinstance(old_pool, SlidingWindowPool):
+                    self._pools[limit_id] = old_pool.rebuilt(
+                        scaled.limit, scaled.time_interval, self._margin, now
+                    )
+                if old_scaled.get(limit_id) == scaled:
                     self._owners[limit_id] = old_owners.get(limit_id)
 
     def _install(self, raw: RateLimit, owner: str | None) -> None:
@@ -177,35 +187,38 @@ class RateLimiter:
 
     # ---- planning -------------------------------------------------------------------
 
-    def _unknown(self, limit_id: str, detail: str) -> None:
+    def _unknown(self, limit_id: str, detail: str, notes: list[str]) -> None:
+        """Raise, or queue the warn-once message in ``notes`` (logged after the lock is freed)."""
         if self._unknown_mode == "raise":
             raise UnknownRateLimitError(f"{detail}: unknown rate limit {limit_id!r}")
         if limit_id not in self._unknown_warned:
             self._unknown_warned.add(limit_id)
-            logger.warning("%s: unknown rate limit %r; running unthrottled", detail, limit_id)
+            notes.append(f"{detail}: unknown rate limit {limit_id!r}; running unthrottled")
 
     def _plan(
-        self, limit_id: str, weights: Mapping[str, int] | None
+        self, limit_id: str, weights: Mapping[str, int] | None, notes: list[str]
     ) -> list[tuple[str, int]] | None:
         """Resolve the charges for one call (lock held). ``None`` = run unthrottled."""
         primary = self._scaled.get(limit_id)
-        if primary is None:
-            self._unknown(limit_id, "acquire")
-            return None
-        charges: dict[str, int] = {limit_id: primary.weight}
         declared = {limit_id}
-        for pair in primary.linked_limits:
-            declared.add(pair.limit_id)
-            if pair.limit_id in self._scaled:
-                charges[pair.limit_id] = charges.get(pair.limit_id, 0) + pair.weight
-            else:
-                self._unknown(pair.limit_id, f"acquire {limit_id!r} (linked)")
+        if primary is not None:
+            declared.update(pair.limit_id for pair in primary.linked_limits)
         for key, value in (weights or {}).items():
             if key not in declared:
                 raise ValueError(
                     f"weights key {key!r} is neither {limit_id!r} nor one of its linked limits"
                 )
             check_weight(value, f"weights[{key!r}]")
+        if primary is None:
+            self._unknown(limit_id, "acquire", notes)
+            return None
+        charges: dict[str, int] = {limit_id: primary.weight}
+        for pair in primary.linked_limits:
+            if pair.limit_id in self._scaled:
+                charges[pair.limit_id] = charges.get(pair.limit_id, 0) + pair.weight
+            else:
+                self._unknown(pair.limit_id, f"acquire {limit_id!r} (linked)", notes)
+        for key, value in (weights or {}).items():
             if key in charges:
                 charges[key] = value
         for charge_id, cost in charges.items():
@@ -218,8 +231,13 @@ class RateLimiter:
 
     def _validate(self, limit_id: str, weights: Mapping[str, int] | None) -> bool:
         """Raise on a bad call; return False when the call runs unthrottled."""
-        with self._lock:
-            return self._plan(limit_id, weights) is not None
+        notes: list[str] = []
+        try:
+            with self._lock:
+                return self._plan(limit_id, weights, notes) is not None
+        finally:
+            for message in notes:
+                logger.warning(message)
 
     def _assess(
         self, plan: list[tuple[str, int]], now: float, through: float, record: bool
@@ -259,20 +277,22 @@ class RateLimiter:
         "allow" mode skip the window but still honour pauses.
         """
         warnings: list[str] = []
-        with self._lock:
-            now = self._clock()
-            plan = self._plan(limit_id, weights)
-            pause_wait = max(0.0, self._paused_until_locked(limit_id) - now)
-            if record and pause_wait > 0.0:
-                return pause_wait, now, True
-            window_wait = 0.0
-            if plan is not None:
-                through = deadline if now >= deadline else -math.inf
-                window_wait = self._assess(plan, now, through, record)
-                if record and window_wait == 0.0:
-                    warnings = self._near_capacity(plan, now)
-        for message in warnings:
-            logger.warning(message)
+        try:
+            with self._lock:
+                now = self._clock()
+                plan = self._plan(limit_id, weights, warnings)
+                pause_wait = max(0.0, self._paused_until_locked(limit_id) - now)
+                if record and pause_wait > 0.0:
+                    return pause_wait, now, True
+                window_wait = 0.0
+                if plan is not None:
+                    through = deadline if now >= deadline else -math.inf
+                    window_wait = self._assess(plan, now, through, record)
+                    if record and window_wait == 0.0:
+                        warnings.extend(self._near_capacity(plan, now))
+        finally:
+            for message in warnings:
+                logger.warning(message)
         return max(pause_wait, window_wait), now, False
 
     # ---- acquire --------------------------------------------------------------------
@@ -361,6 +381,10 @@ class RateLimiter:
         self, limit_id: str, retry_after: float | None = None, *, status: int | None = None
     ) -> RateLimitVerdict:
         """Apply the backoff policy to a rate-limit signal (``status=None`` counts as 429)."""
+        if retry_after is not None:
+            if not math.isfinite(retry_after):
+                raise ValueError(f"retry_after must be finite, got {retry_after!r}")
+            retry_after = max(0.0, retry_after)
         effective = 429 if status is None else status
         with self._report_lock:  # one burst-check/escalate/pause step at a time
             in_burst = self.is_paused(limit_id)
@@ -398,7 +422,8 @@ class RateLimiter:
         """Transport-agnostic hook; never raises for HTTP statuses."""
         if status in RATE_LIMIT_STATUSES:
             return self.report_rate_limited(
-                limit_id, RateLimitExceededError.from_response(status, headers)
+                limit_id,
+                RateLimitExceededError.from_response(status, headers, now=self._wall_clock),
             )
         if 200 <= status < 300:
             self.report_success(limit_id)

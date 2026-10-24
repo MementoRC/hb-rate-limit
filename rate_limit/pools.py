@@ -71,6 +71,16 @@ class SlidingWindowPool:
     def used(self) -> float:
         return self._used
 
+    def rebuilt(
+        self, limit: int, window: float, margin_pct: float, now: float
+    ) -> SlidingWindowPool:
+        """A pool with the new definition that carries this pool's history, evicted at ``now``."""
+        pool = SlidingWindowPool(limit, window, margin_pct)
+        pool._history = self._history
+        pool._used = self._used
+        pool.evict(now)
+        return pool
+
     def evict(self, now: float, expired_through: float = -math.inf) -> None:
         window = self._window
         history = self._history

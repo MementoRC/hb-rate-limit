@@ -34,13 +34,14 @@ def get_pool_limiter(
     *,
     clock: Clock = time.monotonic,
     sleep: Sleep = asyncio.sleep,
+    wall_clock: Callable[[], float] = time.time,
     owner: str | None = None,
     backoff_factory: Callable[[], BackoffPolicy] | None = None,
 ) -> BoundLimiter:
     """Return the process-wide limiter for ``pool_key``, creating it on first use.
 
-    The first caller's clock, sleep and backoff factory win. The pool's single limit takes
-    ``pool_key`` as its ``limit_id``. Callers sharing a budget pass the same key; use a
+    The first caller's clock, sleep, wall clock and backoff factory win. The pool's single
+    limit takes ``pool_key`` as its ``limit_id``. Callers sharing a budget pass the same key; use a
     non-reversible tag (never the API key itself) when keying by credentials.
 
     :raises RateLimitPoolConflictError: the pool exists with a different raw definition
@@ -61,6 +62,7 @@ def get_pool_limiter(
                 [requested],
                 clock=clock,
                 sleep=sleep,
+                wall_clock=wall_clock,
                 backoff_factory=backoff_factory or BackoffPolicy,
             )
             entry = _LIMITERS[pool_key] = _Entry(limiter, requested, owner)

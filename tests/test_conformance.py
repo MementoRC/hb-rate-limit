@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Sequence
 from decimal import Decimal
 from types import SimpleNamespace
@@ -129,6 +130,15 @@ def test_manual_clock() -> None:
     assert clock() == 5.0
     clock.advance(2)
     assert clock() == 7.0
+
+
+async def test_manual_clock_concurrent_sleeps_do_not_sum() -> None:
+    clock = ManualClock()
+    await asyncio.gather(clock.sleep(10), clock.sleep(10))
+    assert clock() == 10
+    clock = ManualClock()
+    await asyncio.gather(clock.sleep(3), clock.sleep(10))
+    assert clock() == 10
 
 
 async def test_manual_clock_sleep_records_and_advances() -> None:
