@@ -1,1 +1,1 @@
-# conftest.py — shared fixtures go here as the test suite grows
+pytest_plugins = ["rate_limit.testing.pytest_plugin"]
