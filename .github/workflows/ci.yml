@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+    branches: [main, development]
+
+# Cancel in-progress CI runs for the same ref/branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Deny all permissions by default; each job requests only what it needs.
+permissions: {}
+
+jobs:
+  ci:
+    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-ci.yml@fe3991399e33c62e9b56a9336694ce4e9deb63c5 # v2.9.7
+    permissions:
+      contents: write
+      id-token: write
+      pull-requests: write
+      actions: read
+      checks: write
+    secrets: inherit
+    with:
+      codeql: true
+      pixi-environment: "ci"
+      python-versions: '["3.12"]'
+      os-matrix: '["ubuntu-latest"]'
+      enable-performance: false
+      enable-hygiene-check: true
+      editable-install: true
+      package-path: "."
+      allowed-licenses: "MIT, Apache-2.0, BSD-3-Clause, BSD-2-Clause, ISC, PSF-2.0, LGPL-3.0"
+
+  branch-policy:
+    name: "Branch Policy"
+    runs-on: ubuntu-latest
+    permissions: {}
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    env:
+      # Capture untrusted ref into environment variable before use in shell
+      HEAD_REF: ${{ github.head_ref }}
+    steps:
+      - name: Check source branch
+        run: |
+          if [ "$HEAD_REF" != "development" ]; then
+            echo "PRs to main must come from development branch"
+            echo "   Source: $HEAD_REF"
+            echo "   Expected: development"
+            exit 1
+          fi
+          echo "PR from development to main - allowed"
+
+  ci-success:
+    name: "CI Success"
+    runs-on: ubuntu-latest
+    permissions: {}
+    needs: [ci]
+    if: always()
+    steps:
+      - name: Check CI status
+        env:
+          CI_RESULT: ${{ needs.ci.result }}
+        run: |
+          if [ "$CI_RESULT" != "success" ]; then
+            echo "CI failed"
+            exit 1
+          fi
+          echo "CI passed"
