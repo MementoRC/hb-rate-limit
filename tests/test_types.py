@@ -97,6 +97,32 @@ def test_coerce_limit_identity_and_structural() -> None:
     )
 
 
+def test_kind_defaults_to_window_and_takes_part_in_equality() -> None:
+    bucket = RateLimit("a", 5, 1, kind="token_bucket")
+    assert RateLimit("a", 5, 1).kind == "window"
+    assert bucket.kind == "token_bucket"
+    assert bucket != RateLimit("a", 5, 1)
+    assert "token_bucket" in repr(bucket)
+    assert RateLimit.per_second("s", 3, kind="token_bucket").kind == "token_bucket"
+
+
+@pytest.mark.parametrize("kind", ["", "bucket", None, 1])
+def test_kind_validation(kind: object) -> None:
+    with pytest.raises(ValueError, match="kind"):
+        RateLimit("a", 5, 1, kind=kind)  # type: ignore[arg-type]
+
+
+def test_scaled_preserves_kind() -> None:
+    assert RateLimit("a", 10, 2, kind="token_bucket").scaled(Decimal("0.5")).kind == "token_bucket"
+
+
+def test_coerce_limit_reads_optional_kind() -> None:
+    legacy = SimpleNamespace(limit_id="a", limit=5, time_interval=1.0, weight=1, linked_limits=[])
+    assert coerce_limit(legacy).kind == "window"
+    legacy.kind = "token_bucket"  # type: ignore[attr-defined]
+    assert coerce_limit(legacy).kind == "token_bucket"
+
+
 def test_sliding_window_pool_basics() -> None:
     pool = SlidingWindowPool(2, 10.0)
     assert pool.capacity == 2

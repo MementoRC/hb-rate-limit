@@ -191,6 +191,101 @@ class TestSetLimitsHistory:
         assert rl.try_acquire("a") == 0.0
 
 
+def bucket(limit_id: str, limit: int, interval: float) -> RateLimit:
+    return RateLimit(limit_id, limit, interval, kind="token_bucket")
+
+
+class TestTokenBucket:
+    async def test_burst_then_paced(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 5, 5))  # capacity 5, refill 1/s
+        for _ in range(5):
+            await rl.acquire("a")
+        assert clock.sleeps == []
+        await rl.acquire("a")
+        await rl.acquire("a")
+        assert clock.sleeps == [pytest.approx(1.0), pytest.approx(1.0)]
+        assert clock.now == pytest.approx(1002.0)
+
+    async def test_idle_time_refills_fractionally(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 4, 4))
+        for _ in range(4):
+            await rl.acquire("a")
+        clock.advance(2.5)
+        assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == pytest.approx(0.5)
+
+    async def test_weights_are_charged(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 10, 10))
+        await rl.acquire("a", {"a": 10})
+        assert rl.try_acquire("a", {"a": 4}) == pytest.approx(4.0)
+        with pytest.raises(RateLimitWeightError):
+            await rl.acquire("a", {"a": 11})
+
+    async def test_limits_pct_scales_capacity_and_refill(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 10, 10), limits_pct=Decimal("0.5"))
+        assert rl.get_limit("a") == bucket("a", 5, 10)
+        for _ in range(5):
+            assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == pytest.approx(2.0)  # refill 5 / 10s = 0.5/s
+
+    async def test_margin_slows_refill(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 4, 4), safety_margin_pct=0.25)
+        for _ in range(4):
+            await rl.acquire("a")
+        assert rl.try_acquire("a") == pytest.approx(1.25)
+
+    async def test_linked_buckets_and_windows_mix(self, clock: ManualClock) -> None:
+        link = LinkedLimitWeightPair("w")
+        rl = make(
+            clock,
+            RateLimit("a", 3, 3, linked_limits=[link], kind="token_bucket"),
+            RateLimit("w", 2, 10),
+        )
+        await rl.acquire("a")
+        await rl.acquire("a")
+        assert rl.try_acquire("a") == pytest.approx(10.0)  # window is the tighter pool
+
+    async def test_deadline_wait_passes_without_a_second_sleep(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 3, 7))  # awkward refill: 3 / 7 per second
+        for _ in range(3):
+            await rl.acquire("a")
+        for _ in range(20):
+            await rl.acquire("a")
+        assert len(clock.sleeps) == 20
+
+
+class TestSetLimitsKinds:
+    async def test_bucket_keeps_deficit_across_resize(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 5, 5))
+        await rl.acquire("a", {"a": 5})
+        rl.set_limits([bucket("a", 10, 10)])
+        assert rl.try_acquire("a", {"a": 5}) == 0.0  # 10 - 5 used
+        assert rl.try_acquire("a") == pytest.approx(1.0)
+
+    async def test_window_to_bucket_converts_used_to_deficit(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 3, 10))
+        for _ in range(3):
+            await rl.acquire("a")
+        rl.set_limits([bucket("a", 3, 3)])
+        assert rl.try_acquire("a") == pytest.approx(1.0)
+
+    async def test_bucket_to_window_seeds_rounded_up_charge(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 5, 5))
+        await rl.acquire("a", {"a": 5})
+        clock.advance(2.5)
+        rl.set_limits([RateLimit("a", 5, 10)])  # 2.5 used -> a 3-unit charge stamped now
+        assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == pytest.approx(10.0)
+
+    async def test_window_to_window_still_rebuilds(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        await rl.acquire("a")
+        rl.set_limits([RateLimit("a", 1, 10)])
+        assert rl.try_acquire("a") > 0
+
+
 class TestAcquireWindow:
     async def test_window_waits_exactly_interval(self, clock: ManualClock) -> None:
         rl = make(clock, RateLimit("a", 2, 10))

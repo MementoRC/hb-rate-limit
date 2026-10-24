@@ -30,7 +30,7 @@ from rate_limit.errors import (
     RateLimitWeightError,
     UnknownRateLimitError,
 )
-from rate_limit.pools import Pool, SlidingWindowPool
+from rate_limit.pools import Pool, carry_over, new_pool
 from rate_limit.types import Clock, RateLimit, RateLimitLike, Sleep, check_weight, coerce_limit
 
 if TYPE_CHECKING:
@@ -131,10 +131,10 @@ class RateLimiter:
             self._install(raw, owner)
 
     def set_limits(self, limits: Iterable[RateLimitLike]) -> None:
-        """Replace all definitions; history carries over for every retained id.
+        """Replace all definitions; usage carries over for every retained id.
 
-        The window holds traffic the venue already counted, so it stays valid under a new
-        limit, interval, weight or link; it is dropped only when an id is removed.
+        The pool holds traffic the venue already counted, so it stays valid under a new
+        limit, interval, weight, link or kind; it is dropped only when an id is removed.
         """
         incoming = {raw.limit_id: raw for raw in map(coerce_limit, limits)}
         with self._lock:
@@ -145,9 +145,14 @@ class RateLimiter:
                 self._install(raw, None)
                 scaled = self._scaled[limit_id]
                 old_pool = old_pools.get(limit_id)
-                if isinstance(old_pool, SlidingWindowPool):
-                    self._pools[limit_id] = old_pool.rebuilt(
-                        scaled.limit, scaled.time_interval, self._margin, now
+                if old_pool is not None:
+                    self._pools[limit_id] = carry_over(
+                        old_pool,
+                        scaled.kind,
+                        scaled.limit,
+                        scaled.time_interval,
+                        self._margin,
+                        now,
                     )
                 if old_scaled.get(limit_id) == scaled:
                     self._owners[limit_id] = old_owners.get(limit_id)
@@ -157,8 +162,8 @@ class RateLimiter:
         self._raw[raw.limit_id] = raw
         self._scaled[raw.limit_id] = scaled
         self._owners[raw.limit_id] = owner
-        self._pools[raw.limit_id] = SlidingWindowPool(
-            scaled.limit, scaled.time_interval, self._margin
+        self._pools[raw.limit_id] = new_pool(
+            scaled.kind, scaled.limit, scaled.time_interval, self._margin
         )
 
     def has_limit(self, limit_id: str) -> bool:

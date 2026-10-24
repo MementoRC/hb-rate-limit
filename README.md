@@ -68,7 +68,7 @@ Share one budget across instances with `get_pool_limiter(pool_key, limit)`; test
 ## Status
 
 v0.1.0: sliding-window pools, registry, pause/backoff, helpers and the conformance kit.
-`TokenBucketPool` is an interface only (implementation planned for v0.2).
+v0.2 (in progress): `TokenBucketPool`, selected per limit with `RateLimit(..., kind="token_bucket")`.
 
 ---
 

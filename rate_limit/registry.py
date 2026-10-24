@@ -49,7 +49,12 @@ def get_pool_limiter(
     """
     given = coerce_limit(limit)
     requested = RateLimit(
-        pool_key, given.limit, given.time_interval, given.weight, given.linked_limits
+        pool_key,
+        given.limit,
+        given.time_interval,
+        given.weight,
+        given.linked_limits,
+        kind=given.kind,
     )
     with _REGISTRY_LOCK:
         entry = _LIMITERS.get(pool_key)
