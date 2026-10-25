@@ -40,6 +40,7 @@ from rate_limit.registry import get_pool_limiter, reset_pool_limiters
 from rate_limit.types import (
     Clock,
     LinkedLimitWeightPair,
+    PoolKind,
     RateLimit,
     RateLimitLike,
     Sleep,
@@ -61,6 +62,7 @@ __all__ = [
     "PausableRateLimiterProtocol",
     "PauseState",
     "Pool",
+    "PoolKind",
     "PoolPauseProtocol",
     "RateLimit",
     "RateLimitExceededError",

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
     from rate_limit.limiter import RateLimiter
     from rate_limit.protocols import RestRateLimiterProtocol
+    from rate_limit.types import Clock
 
 logger = logging.getLogger(__name__)
 
@@ -66,19 +67,19 @@ def _first_unpausable_warning(limiter: Any) -> bool:
     return True
 
 
-def _in_own_pause(limiter: Any) -> bool:
+def _in_own_pause(limiter: Any, clock: Clock | None = None) -> bool:
     """Whether a pause this helper set on ``limiter`` is still running."""
     try:
         deadline = _OWN_PAUSE_DEADLINES.get(limiter)
     except TypeError:  # not weak-referenceable: memoryless
         return False
-    return deadline is not None and _CLOCK() < deadline
+    return deadline is not None and (clock or _CLOCK)() < deadline
 
 
-def _remember_pause(limiter: Any, delay: float) -> None:
+def _remember_pause(limiter: Any, delay: float, clock: Clock | None = None) -> None:
     with contextlib.suppress(TypeError):  # not weak-referenceable: memoryless
         _OWN_PAUSE_DEADLINES[limiter] = max(
-            _OWN_PAUSE_DEADLINES.get(limiter, 0.0), _CLOCK() + delay
+            _OWN_PAUSE_DEADLINES.get(limiter, 0.0), (clock or _CLOCK)() + delay
         )
 
 
@@ -90,14 +91,18 @@ def _limiter_label(limiter: Any) -> str:
     )
 
 
-def note_rate_limited(limiter: RestRateLimiterProtocol, exc: RateLimitExceededError) -> None:
+def note_rate_limited(
+    limiter: RestRateLimiterProtocol, exc: RateLimitExceededError, *, clock: Clock | None = None
+) -> None:
     """Pause ``limiter`` after a rate-limit error and log one warning for the event.
 
     Limiters without ``pause()`` cannot back off: that is logged once and nothing else
     happens (the caller re-raises the error). A limiter with ``pause()`` but no
-    ``is_paused()`` gets burst detection from the pause deadline this helper set itself
-    (``time.monotonic``); if it cannot be weak-referenced the helper is memoryless and every
-    signal escalates.
+    ``is_paused()`` gets burst detection from the pause deadline this helper set itself,
+    measured on ``clock`` (default ``time.monotonic``); pass the same clock for a given
+    limiter on every call, since the remembered deadline is compared on it. If the limiter
+    cannot be weak-referenced the helper is memoryless and every signal escalates.
+    ``clock`` has no effect on a :class:`BoundLimiter`, which uses its own limiter's clock.
     """
     if isinstance(limiter, BoundLimiter):
         limiter.limiter.report_rate_limited(limiter.limit_id, exc)  # 418 pauses every limit
@@ -113,14 +118,14 @@ def note_rate_limited(limiter: RestRateLimiterProtocol, exc: RateLimitExceededEr
             )
         return
     is_paused = getattr(limiter, "is_paused", None)
-    in_burst = bool(is_paused()) if callable(is_paused) else _in_own_pause(limiter)
+    in_burst = bool(is_paused()) if callable(is_paused) else _in_own_pause(limiter, clock)
     delay = _backoff_for(limiter).next_delay(status, exc.retry_after, in_burst)
     if delay == 0.0 and in_burst:
         logger.debug("Status %s on %s joins the active pause", status, _limiter_label(limiter))
         return
     pause(delay)
     if not callable(is_paused):
-        _remember_pause(limiter, delay)
+        _remember_pause(limiter, delay, clock)
     note = (
         " (unusually long Retry-After, honoured)"
         if exc.retry_after is not None and exc.retry_after > LONG_RETRY_AFTER_WARN_SECONDS
@@ -147,17 +152,22 @@ def note_request_succeeded(limiter: RestRateLimiterProtocol) -> None:
         policy.reset()
 
 
-async def run_paced[T](limiter: RestRateLimiterProtocol, call: Callable[[], Awaitable[T]]) -> T:
+async def run_paced[T](
+    limiter: RestRateLimiterProtocol,
+    call: Callable[[], Awaitable[T]],
+    *,
+    clock: Clock | None = None,
+) -> T:
     """Acquire once, run ``call``, and apply rate-limit backoff bookkeeping.
 
     A ``RateLimitExceededError`` pauses the limiter and propagates; success resets the
-    backoff streak.
+    backoff streak. ``clock`` is forwarded to :func:`note_rate_limited`.
     """
     await limiter.acquire()
     try:
         result = await call()
     except RateLimitExceededError as exc:
-        note_rate_limited(limiter, exc)
+        note_rate_limited(limiter, exc, clock=clock)
         raise
     note_request_succeeded(limiter)
     return result

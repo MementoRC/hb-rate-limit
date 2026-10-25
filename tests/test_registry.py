@@ -96,6 +96,51 @@ def test_raw_mismatch_raises_and_names_owner(other: RateLimit) -> None:
     assert "second" in str(excinfo.value)
 
 
+def test_kind_mismatch_is_a_pool_conflict() -> None:
+    get_pool_limiter("p", RateLimit("x", 1, 10), owner="first")
+    with pytest.raises(RateLimitPoolConflictError):
+        get_pool_limiter("p", RateLimit("x", 1, 10, kind="token_bucket"), owner="second")
+
+
+async def test_bucket_pool_is_created_and_shared(clock: ManualClock) -> None:
+    limit = RateLimit("x", 2, 2, kind="token_bucket")
+    first = get_pool_limiter("p", limit, clock=clock, sleep=clock.sleep)
+    second = get_pool_limiter("p", limit)
+    assert first.limiter is second.limiter
+    assert first.limiter.get_limit("p") == RateLimit("p", 2, 2, kind="token_bucket")
+    await first.acquire()
+    await second.acquire()
+    assert first.blocked_for() == pytest.approx(1.0)
+
+
+async def test_margin_is_passed_to_the_limiter(clock: ManualClock) -> None:
+    pool = get_pool_limiter(
+        "p", RateLimit("x", 1, 10), clock=clock, sleep=clock.sleep, safety_margin_pct=0.05
+    )
+    await pool.acquire()
+    assert pool.blocked_for() == pytest.approx(10.5)
+
+
+async def test_margin_defaults_to_zero(clock: ManualClock) -> None:
+    pool = get_pool_limiter("p", RateLimit("x", 1, 10), clock=clock, sleep=clock.sleep)
+    await pool.acquire()
+    assert pool.blocked_for() == pytest.approx(10.0)
+
+
+def test_margin_mismatch_is_a_pool_conflict() -> None:
+    get_pool_limiter("p", RateLimit("x", 1, 10), safety_margin_pct=0.05, owner="first")
+    with pytest.raises(RateLimitPoolConflictError, match="first") as excinfo:
+        get_pool_limiter("p", RateLimit("x", 1, 10), owner="second")
+    assert "safety_margin_pct 0.05" in str(excinfo.value)
+    assert get_pool_limiter("p", RateLimit("x", 1, 10), safety_margin_pct=0.05)
+
+
+@pytest.mark.parametrize("margin", [-0.1, float("nan"), float("inf")])
+def test_invalid_margin_rejected(margin: float) -> None:
+    with pytest.raises(ValueError, match="safety_margin_pct"):
+        get_pool_limiter("p", RateLimit("x", 1, 10), safety_margin_pct=margin)
+
+
 def test_linked_limits_rejected_at_creation() -> None:
     linked = RateLimit("x", 1, 10, linked_limits=[LinkedLimitWeightPair("y")])
     with pytest.raises(ValueError, match="single-limit"):

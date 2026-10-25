@@ -191,6 +191,101 @@ class TestSetLimitsHistory:
         assert rl.try_acquire("a") == 0.0
 
 
+def bucket(limit_id: str, limit: int, interval: float) -> RateLimit:
+    return RateLimit(limit_id, limit, interval, kind="token_bucket")
+
+
+class TestTokenBucket:
+    async def test_burst_then_paced(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 5, 5))  # capacity 5, refill 1/s
+        for _ in range(5):
+            await rl.acquire("a")
+        assert clock.sleeps == []
+        await rl.acquire("a")
+        await rl.acquire("a")
+        assert clock.sleeps == [pytest.approx(1.0), pytest.approx(1.0)]
+        assert clock.now == pytest.approx(1002.0)
+
+    async def test_idle_time_refills_fractionally(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 4, 4))
+        for _ in range(4):
+            await rl.acquire("a")
+        clock.advance(2.5)
+        assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == pytest.approx(0.5)
+
+    async def test_weights_are_charged(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 10, 10))
+        await rl.acquire("a", {"a": 10})
+        assert rl.try_acquire("a", {"a": 4}) == pytest.approx(4.0)
+        with pytest.raises(RateLimitWeightError):
+            await rl.acquire("a", {"a": 11})
+
+    async def test_limits_pct_scales_capacity_and_refill(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 10, 10), limits_pct=Decimal("0.5"))
+        assert rl.get_limit("a") == bucket("a", 5, 10)
+        for _ in range(5):
+            assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == pytest.approx(2.0)  # refill 5 / 10s = 0.5/s
+
+    async def test_margin_slows_refill(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 4, 4), safety_margin_pct=0.25)
+        for _ in range(4):
+            await rl.acquire("a")
+        assert rl.try_acquire("a") == pytest.approx(1.25)
+
+    async def test_linked_buckets_and_windows_mix(self, clock: ManualClock) -> None:
+        link = LinkedLimitWeightPair("w")
+        rl = make(
+            clock,
+            RateLimit("a", 3, 3, linked_limits=[link], kind="token_bucket"),
+            RateLimit("w", 2, 10),
+        )
+        await rl.acquire("a")
+        await rl.acquire("a")
+        assert rl.try_acquire("a") == pytest.approx(10.0)  # window is the tighter pool
+
+    async def test_deadline_wait_passes_without_a_second_sleep(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 3, 7))  # awkward refill: 3 / 7 per second
+        for _ in range(3):
+            await rl.acquire("a")
+        for _ in range(20):
+            await rl.acquire("a")
+        assert len(clock.sleeps) == 20
+
+
+class TestSetLimitsKinds:
+    async def test_bucket_keeps_deficit_across_resize(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 5, 5))
+        await rl.acquire("a", {"a": 5})
+        rl.set_limits([bucket("a", 10, 10)])
+        assert rl.try_acquire("a", {"a": 5}) == 0.0  # 10 - 5 used
+        assert rl.try_acquire("a") == pytest.approx(1.0)
+
+    async def test_window_to_bucket_converts_used_to_deficit(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 3, 10))
+        for _ in range(3):
+            await rl.acquire("a")
+        rl.set_limits([bucket("a", 3, 3)])
+        assert rl.try_acquire("a") == pytest.approx(1.0)
+
+    async def test_bucket_to_window_seeds_rounded_up_charge(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 5, 5))
+        await rl.acquire("a", {"a": 5})
+        clock.advance(2.5)
+        rl.set_limits([RateLimit("a", 5, 10)])  # 2.5 used -> a 3-unit charge stamped now
+        assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == pytest.approx(10.0)
+
+    async def test_window_to_window_still_rebuilds(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        await rl.acquire("a")
+        rl.set_limits([RateLimit("a", 1, 10)])
+        assert rl.try_acquire("a") > 0
+
+
 class TestAcquireWindow:
     async def test_window_waits_exactly_interval(self, clock: ManualClock) -> None:
         rl = make(clock, RateLimit("a", 2, 10))
@@ -537,6 +632,200 @@ class TestPause:
         started = asyncio.get_running_loop().time()
         await asyncio.to_thread(lambda: asyncio.run(rl.acquire("a")))
         assert asyncio.get_running_loop().time() - started >= 0.12
+
+
+class BlockingSleep:
+    """A sleep that only ends when cancelled, so tests control when a sleeper may wake."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.durations: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.durations.append(seconds)
+        self.started.set()
+        await asyncio.Event().wait()
+
+
+class TestRetryAfterCap:
+    def test_default_honours_server_value(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 5, 1))
+        assert rl.report_throttled("a", 7200).delay == 7200
+
+    def test_cap_clamps_and_logs_both_values(
+        self, clock: ManualClock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        rl = make(clock, RateLimit("a", 5, 1), max_retry_after_seconds=60)
+        with caplog.at_level(logging.WARNING, logger="rate_limit.limiter"):
+            verdict = rl.report_throttled("a", 7200)
+        assert (verdict.delay, verdict.retry_after) == (60, 60)
+        assert rl.paused_until("a") == pytest.approx(clock.now + 60)
+        capped = [r.getMessage() for r in caplog.records if "7200" in r.getMessage()]
+        assert len(capped) == 1
+        assert "60" in capped[0]
+        assert not any("honoured" in r.getMessage() for r in caplog.records)
+
+    def test_values_at_or_below_cap_are_untouched(
+        self, clock: ManualClock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        rl = make(clock, RateLimit("a", 5, 1), max_retry_after_seconds=60)
+        with caplog.at_level(logging.WARNING, logger="rate_limit.limiter"):
+            assert rl.report_throttled("a", 60).delay == 60
+        assert all("exceeds" not in r.getMessage() for r in caplog.records)
+
+    def test_cap_does_not_alter_backoff_derived_delays(self, clock: ManualClock) -> None:
+        rl = make(
+            clock,
+            RateLimit("a", 5, 1),
+            max_retry_after_seconds=1,
+            backoff_factory=lambda: BackoffPolicy.fixed(30),
+        )
+        verdict = rl.report_throttled("a")
+        assert (verdict.delay, verdict.retry_after) == (30, None)
+
+    def test_cap_applies_to_418(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 5, 1), max_retry_after_seconds=5)
+        verdict = rl.report_throttled("a", 900, status=418)
+        assert (verdict.delay, verdict.paused_all) == (5, True)
+
+    @pytest.mark.parametrize("cap", [0, -1, float("nan"), float("inf")])
+    def test_cap_validation(self, cap: float) -> None:
+        with pytest.raises(ValueError, match="max_retry_after_seconds"):
+            RateLimiter(max_retry_after_seconds=cap)
+
+
+class TestUnpause:
+    @staticmethod
+    def blocked(clock: ManualClock, sleeper: BlockingSleep, *limits: RateLimit) -> RateLimiter:
+        return RateLimiter(limits, clock=clock, sleep=sleeper)
+
+    async def test_unpause_wakes_a_sleeping_acquirer_without_advancing_time(
+        self, clock: ManualClock
+    ) -> None:
+        sleeper = BlockingSleep()
+        rl = self.blocked(clock, sleeper, RateLimit("a", 5, 1))
+        rl.pause("a", 7200)
+        task = asyncio.create_task(rl.acquire("a"))
+        await sleeper.started.wait()
+        assert not task.done()
+        rl.unpause("a")
+        await asyncio.wait_for(task, 1)
+        assert clock.now == 1000.0
+        assert sleeper.durations == [pytest.approx(7200.0)]
+        assert not rl.is_paused("a")
+
+    async def test_unpause_all_lifts_global_and_per_id_pauses(self, clock: ManualClock) -> None:
+        sleeper = BlockingSleep()
+        rl = self.blocked(clock, sleeper, RateLimit("a", 5, 1), RateLimit("b", 5, 1))
+        rl.pause_all(7200)
+        rl.pause("b", 9000)
+        task = asyncio.create_task(rl.acquire("b"))
+        await sleeper.started.wait()
+        rl.unpause_all()
+        await asyncio.wait_for(task, 1)
+        assert not rl.is_paused("a") and not rl.is_paused("b")
+        assert clock.now == 1000.0
+
+    async def test_unpause_wakes_every_sleeper(self, clock: ManualClock) -> None:
+        sleeper = BlockingSleep()
+        rl = self.blocked(clock, sleeper, RateLimit("a", 5, 1))
+        rl.pause("a", 7200)
+        tasks = [asyncio.create_task(rl.acquire("a")) for _ in range(3)]
+        while len(sleeper.durations) < 3:
+            await asyncio.sleep(0)
+        rl.unpause("a")
+        await asyncio.wait_for(asyncio.gather(*tasks), 1)
+
+    async def test_still_paused_acquirer_goes_back_to_sleep(self, clock: ManualClock) -> None:
+        sleeper = BlockingSleep()
+        rl = self.blocked(clock, sleeper, RateLimit("a", 5, 1))
+        rl.pause("a", 7200)
+        rl.pause_all(100)
+        task = asyncio.create_task(rl.acquire("a"))
+        await sleeper.started.wait()
+        rl.unpause("a")  # pause_all remains
+        while len(sleeper.durations) < 2:
+            await asyncio.sleep(0)
+        assert sleeper.durations[1] == pytest.approx(100.0)
+        assert not task.done()
+        rl.unpause_all()
+        await asyncio.wait_for(task, 1)
+
+    async def test_unpause_does_not_free_pool_capacity(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        await rl.acquire("a")
+        rl.pause("a", 3)
+        rl.unpause("a")
+        assert rl.try_acquire("a") == pytest.approx(10.0)
+        rl.pause_all(3)
+        rl.unpause_all()
+        assert rl.try_acquire("a") == pytest.approx(10.0)
+
+    def test_unpause_unknown_id_is_a_noop(self, clock: ManualClock) -> None:
+        rl = make(clock)
+        rl.unpause("nope")
+        rl.pause("late", 4)
+        rl.unpause("late")
+        assert not rl.is_paused("late")
+
+    async def test_unpause_leaves_backoff_streak_alone(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 5, 1))
+        rl.report_throttled("a")
+        rl.unpause("a")
+        assert rl.backoff("a").streak == 1
+        rl.report_throttled("a")  # no longer a burst: the streak escalates
+        assert rl.backoff("a").streak == 2
+
+    async def test_cancelled_paused_acquire_leaks_nothing(self, clock: ManualClock) -> None:
+        sleeper = BlockingSleep()
+        rl = self.blocked(clock, sleeper, RateLimit("a", 5, 1))
+        rl.pause("a", 7200)
+        before = asyncio.all_tasks()
+        task = asyncio.create_task(rl.acquire("a"))
+        await sleeper.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert asyncio.all_tasks() == before
+        rl.unpause("a")  # waker already deregistered: nothing to wake
+
+    async def test_sleep_failure_propagates(self, clock: ManualClock) -> None:
+        async def broken(seconds: float) -> None:
+            raise RuntimeError("sleep failed")
+
+        rl = RateLimiter([RateLimit("a", 5, 1)], clock=clock, sleep=broken)
+        rl.pause("a", 5)
+        with pytest.raises(RuntimeError, match="sleep failed"):
+            await rl.acquire("a")
+
+    async def test_unpause_from_another_thread(self, clock: ManualClock) -> None:
+        sleeper = BlockingSleep()
+        rl = self.blocked(clock, sleeper, RateLimit("a", 5, 1))
+        rl.pause("a", 7200)
+        task = asyncio.create_task(rl.acquire("a"))
+        await sleeper.started.wait()
+        await asyncio.to_thread(rl.unpause, "a")
+        await asyncio.wait_for(task, 1)
+
+    async def test_plain_pacing_sleep_is_not_interruptible_by_unpause(
+        self, clock: ManualClock
+    ) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        await rl.acquire("a")
+        rl.unpause_all()
+        await rl.acquire("a")
+        assert clock.sleeps == [pytest.approx(10.0)]
+
+    async def test_bound_limiter_forwards(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 5, 1), RateLimit("b", 5, 1))
+        bound = rl.bind("a")
+        bound.pause(50)
+        rl.pause("b", 50)
+        bound.unpause()
+        assert not bound.is_paused()
+        assert rl.is_paused("b")
+        bound.unpause_all()
+        assert not rl.is_paused("b")
 
 
 class TestNonBlocking:

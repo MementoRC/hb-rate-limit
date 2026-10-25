@@ -181,6 +181,49 @@ class TestUnpausableLimiter:
         note_rate_limited(limiter, error)
         assert limiter.paused == [5.0, 10.0]
 
+    def test_note_rate_limited_uses_the_given_clock(self, clock: ManualClock) -> None:
+        limiter = self.PauseOnly()
+        error = RateLimitExceededError(status=429)
+        note_rate_limited(limiter, error, clock=clock)
+        note_rate_limited(limiter, error, clock=clock)  # still inside the remembered pause
+        assert limiter.paused == [5.0]
+        clock.advance(5.1)  # only the manual clock moves; real time barely does
+        note_rate_limited(limiter, error, clock=clock)
+        assert limiter.paused == [5.0, 10.0]
+
+    async def test_run_paced_uses_the_given_clock(self, clock: ManualClock) -> None:
+        limiter = self.PauseOnly()
+        error = RateLimitExceededError(status=429)
+        for _ in range(3):
+            with pytest.raises(RateLimitExceededError):
+                await run_paced(limiter, failing(error), clock=clock)
+        assert limiter.paused == [5.0]
+        clock.advance(6)
+        with pytest.raises(RateLimitExceededError):
+            await run_paced(limiter, failing(error), clock=clock)
+        assert limiter.paused == [5.0, 10.0]
+
+    def test_default_clock_stays_monkeypatchable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        now = [0.0]
+        monkeypatch.setattr(helpers, "_CLOCK", lambda: now[0])
+        limiter = self.PauseOnly()
+        error = RateLimitExceededError(status=429)
+        note_rate_limited(limiter, error)
+        note_rate_limited(limiter, error)
+        now[0] = 5.5
+        note_rate_limited(limiter, error)
+        assert limiter.paused == [5.0, 10.0]
+
+    class PauseOnly:
+        def __init__(self) -> None:
+            self.paused: list[float] = []
+
+        async def acquire(self) -> None:
+            return None
+
+        def pause(self, seconds: float) -> None:
+            self.paused.append(seconds)
+
     def test_non_weakrefable_unpausable_limiter_still_warns_once(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:

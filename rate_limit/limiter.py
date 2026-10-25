@@ -9,6 +9,7 @@ behind a sleeper. A cancelled ``acquire`` has recorded nothing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import threading
@@ -30,11 +31,11 @@ from rate_limit.errors import (
     RateLimitWeightError,
     UnknownRateLimitError,
 )
-from rate_limit.pools import Pool, SlidingWindowPool
+from rate_limit.pools import Pool, carry_over, new_pool
 from rate_limit.types import Clock, RateLimit, RateLimitLike, Sleep, check_weight, coerce_limit
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping
+    from collections.abc import Awaitable, Callable, Iterable, Mapping
     from contextlib import AbstractAsyncContextManager
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ class RateLimiter:
         wall_clock: Callable[[], float] = time.time,
         backoff_factory: Callable[[], BackoffPolicy] = BackoffPolicy,
         unknown: Literal["raise", "allow"] = "raise",
+        max_retry_after_seconds: float | None = None,
     ) -> None:
         if not isinstance(limits_pct, Decimal) or not (
             limits_pct.is_finite() and Decimal(0) < limits_pct <= Decimal(1)
@@ -70,7 +72,15 @@ class RateLimiter:
             )
         if unknown not in ("raise", "allow"):
             raise ValueError(f"unknown must be 'raise' or 'allow', got {unknown!r}")
+        if max_retry_after_seconds is not None and (
+            not math.isfinite(max_retry_after_seconds) or max_retry_after_seconds <= 0
+        ):
+            raise ValueError(
+                f"max_retry_after_seconds must be None or finite and > 0, "
+                f"got {max_retry_after_seconds!r}"
+            )
         self._pct = limits_pct
+        self._max_retry_after = max_retry_after_seconds
         self._margin = safety_margin_pct
         self._clock = clock
         self._sleep = sleep
@@ -85,6 +95,8 @@ class RateLimiter:
         self._pools: dict[str, Pool] = {}
         self._states: dict[str, PauseState] = {}
         self._pause_all_until = 0.0
+        # (loop, event) of every acquirer sleeping out a pause; ``unpause*`` sets them
+        self._wakers: set[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = set()
         self._unknown_warned: set[str] = set()
         self._capacity_warned: dict[str, float] = {}
         self.add_limits(limits)
@@ -131,10 +143,10 @@ class RateLimiter:
             self._install(raw, owner)
 
     def set_limits(self, limits: Iterable[RateLimitLike]) -> None:
-        """Replace all definitions; history carries over for every retained id.
+        """Replace all definitions; usage carries over for every retained id.
 
-        The window holds traffic the venue already counted, so it stays valid under a new
-        limit, interval, weight or link; it is dropped only when an id is removed.
+        The pool holds traffic the venue already counted, so it stays valid under a new
+        limit, interval, weight, link or kind; it is dropped only when an id is removed.
         """
         incoming = {raw.limit_id: raw for raw in map(coerce_limit, limits)}
         with self._lock:
@@ -145,9 +157,14 @@ class RateLimiter:
                 self._install(raw, None)
                 scaled = self._scaled[limit_id]
                 old_pool = old_pools.get(limit_id)
-                if isinstance(old_pool, SlidingWindowPool):
-                    self._pools[limit_id] = old_pool.rebuilt(
-                        scaled.limit, scaled.time_interval, self._margin, now
+                if old_pool is not None:
+                    self._pools[limit_id] = carry_over(
+                        old_pool,
+                        scaled.kind,
+                        scaled.limit,
+                        scaled.time_interval,
+                        self._margin,
+                        now,
                     )
                 if old_scaled.get(limit_id) == scaled:
                     self._owners[limit_id] = old_owners.get(limit_id)
@@ -157,8 +174,8 @@ class RateLimiter:
         self._raw[raw.limit_id] = raw
         self._scaled[raw.limit_id] = scaled
         self._owners[raw.limit_id] = owner
-        self._pools[raw.limit_id] = SlidingWindowPool(
-            scaled.limit, scaled.time_interval, self._margin
+        self._pools[raw.limit_id] = new_pool(
+            scaled.kind, scaled.limit, scaled.time_interval, self._margin
         )
 
     def has_limit(self, limit_id: str) -> bool:
@@ -300,16 +317,54 @@ class RateLimiter:
     async def acquire(self, limit_id: str, weights: Mapping[str, int] | None = None) -> None:
         """Wait out pauses and the window, then record the charge.
 
-        Sleeps happen outside every lock; cancelling records nothing.
+        Sleeps happen outside every lock; cancelling records nothing. A sleep spent in a pause
+        ends early when :meth:`unpause` / :meth:`unpause_all` lifts it, and the acquire re-assesses.
         """
         deadline = -math.inf
         while True:
             wait, now, paused = self._try_reserve(limit_id, weights, deadline, record=True)
             if wait == 0.0:
                 return
-            if not paused:
-                deadline = now + wait
+            if paused:
+                await self._sleep_unless_unpaused(limit_id, wait)
+                continue
+            deadline = now + wait
             await self._sleep(wait)
+
+    async def _sleep_unless_unpaused(self, limit_id: str, wait: float) -> None:
+        """Sleep ``wait`` seconds, returning early if an unpause happens meanwhile."""
+        woken = asyncio.Event()
+        waker = (asyncio.get_running_loop(), woken)
+        with self._lock:
+            self._wakers.add(waker)
+        try:
+            # registered first, so an unpause racing with this step is seen here or wakes us
+            if self.paused_until(limit_id) > self._clock():
+                await self._race(self._sleep(wait), woken)
+        finally:
+            with self._lock:
+                self._wakers.discard(waker)
+
+    @staticmethod
+    async def _race(sleep: Awaitable[None], woken: asyncio.Event) -> None:
+        """Await ``sleep`` or ``woken``, whichever ends first; both tasks are reaped."""
+        sleeper = asyncio.ensure_future(sleep)
+        waiter = asyncio.ensure_future(woken.wait())
+        try:
+            await asyncio.wait({sleeper, waiter}, return_when=asyncio.FIRST_COMPLETED)
+            if sleeper.done():
+                sleeper.result()  # surface a failing sleep
+        finally:
+            sleeper.cancel()
+            waiter.cancel()
+            await asyncio.gather(sleeper, waiter, return_exceptions=True)
+
+    def _wake_sleepers(self) -> None:
+        with self._lock:
+            wakers = list(self._wakers)
+        for loop, event in wakers:
+            with contextlib.suppress(RuntimeError):  # that loop has been closed
+                loop.call_soon_threadsafe(event.set)
 
     def execute_task(
         self, limit_id: str, *, weights: Mapping[str, int] | None = None
@@ -344,17 +399,47 @@ class RateLimiter:
         return self._clock() + max(0.0, seconds)
 
     def pause(self, limit_id: str, seconds: float) -> None:
-        """Block acquires touching ``limit_id`` (never shortens; unknown ids are recorded)."""
+        """Block acquires touching ``limit_id``.
+
+        Never shortens an existing pause (use :meth:`unpause` to lift one); unknown ids are
+        recorded.
+        """
         until = self._until(seconds)
         with self._lock:
             state = self._state(limit_id)
             state.deadline = max(state.deadline, until)
 
     def pause_all(self, seconds: float) -> None:
-        """Block every acquire on this limiter (never shortens); used for a 418 IP ban."""
+        """Block every acquire on this limiter; used for a 418 IP ban.
+
+        Never shortens an existing pause (use :meth:`unpause_all` to lift it).
+        """
         until = self._until(seconds)
         with self._lock:
             self._pause_all_until = max(self._pause_all_until, until)
+
+    def unpause(self, limit_id: str) -> None:
+        """Lift the pause set on ``limit_id`` and wake acquirers sleeping out a pause.
+
+        A :meth:`pause_all` stays in force, and pool accounting is untouched. Unknown ids
+        have nothing to lift.
+        """
+        with self._lock:
+            state = self._states.get(limit_id)
+            if state is not None:
+                state.deadline = 0.0
+        self._wake_sleepers()
+
+    def unpause_all(self) -> None:
+        """Lift :meth:`pause_all` and every per-id pause, waking sleeping acquirers.
+
+        Pool accounting is untouched: capacity already spent stays spent.
+        """
+        with self._lock:
+            self._pause_all_until = 0.0
+            for state in self._states.values():
+                state.deadline = 0.0
+        self._wake_sleepers()
 
     def _paused_until_locked(self, limit_id: str) -> float:
         ids = {limit_id}
@@ -380,11 +465,24 @@ class RateLimiter:
     def report_throttled(
         self, limit_id: str, retry_after: float | None = None, *, status: int | None = None
     ) -> RateLimitVerdict:
-        """Apply the backoff policy to a rate-limit signal (``status=None`` counts as 429)."""
+        """Apply the backoff policy to a rate-limit signal (``status=None`` counts as 429).
+
+        A server-supplied ``retry_after`` above ``max_retry_after_seconds`` is clamped to it;
+        delays the :class:`BackoffPolicy` derives itself are never capped.
+        """
         if retry_after is not None:
             if not math.isfinite(retry_after):
                 raise ValueError(f"retry_after must be finite, got {retry_after!r}")
             retry_after = max(0.0, retry_after)
+            cap = self._max_retry_after
+            if cap is not None and retry_after > cap:
+                logger.warning(
+                    "Retry-After %gs for %s exceeds max_retry_after_seconds; capping to %gs",
+                    retry_after,
+                    limit_id,
+                    cap,
+                )
+                retry_after = cap
         effective = 429 if status is None else status
         with self._report_lock:  # one burst-check/escalate/pause step at a time
             in_burst = self.is_paused(limit_id)
@@ -484,6 +582,12 @@ class BoundLimiter:
 
     def pause(self, seconds: float) -> None:
         self._limiter.pause(self._limit_id, seconds)
+
+    def unpause(self) -> None:
+        self._limiter.unpause(self._limit_id)
+
+    def unpause_all(self) -> None:
+        self._limiter.unpause_all()
 
     def is_paused(self) -> bool:
         return self._limiter.is_paused(self._limit_id)

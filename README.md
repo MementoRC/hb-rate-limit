@@ -60,15 +60,37 @@ wait = limiter.try_acquire("klines")
 verdict = limiter.report_response("klines", 429, {"Retry-After": "3"})
 ```
 
-Share one budget across instances with `get_pool_limiter(pool_key, limit)`; tests use
-`rate_limit.testing.ManualClock` and the `assert_conforms_*` suites.
+A limit can be a token bucket instead of a sliding window: capacity `limit`, refilling
+`limit / time_interval` per second. A connector's `PoolSpec(name, capacity, refill_rate)` maps to
+`RateLimit(name, capacity, capacity / refill_rate, kind="token_bucket")`.
+
+```python
+bucket = RateLimiter([RateLimit("orders", 20, 10, kind="token_bucket")])  # burst 20, then 2/s
+```
+
+Cap an unreasonable server `Retry-After`, and lift a pause early (sleeping acquirers wake and
+re-assess; pool accounting is untouched):
+
+```python
+limiter = RateLimiter([RateLimit.per_second("feed", 5)], max_retry_after_seconds=120)
+limiter.report_response("feed", 429, {"Retry-After": "7200"})  # paused for 120s, not 7200s
+limiter.unpause("feed")  # or limiter.unpause_all()
+```
+
+Share one budget across instances with `get_pool_limiter(pool_key, limit)`; the kind and
+`safety_margin_pct` (default 0.0; hb_compat shims pass 0.05) are part of the pool's identity.
+The `run_paced` / `note_rate_limited` helpers take an optional `clock=` for limiters that can
+pause but cannot report `is_paused()`. Tests use `rate_limit.testing.ManualClock` and the
+`assert_conforms_*` suites.
 
 ---
 
 ## Status
 
-v0.1.0: sliding-window pools, registry, pause/backoff, helpers and the conformance kit.
-`TokenBucketPool` is an interface only (implementation planned for v0.2).
+v0.2.0: adds `TokenBucketPool` (per-limit `kind="token_bucket"`), `unpause` / `unpause_all`, an
+opt-in `max_retry_after_seconds` cap, `safety_margin_pct` on `get_pool_limiter`, and an optional
+`clock` for the pacing helpers. v0.1.0 shipped sliding-window pools, the registry, pause/backoff,
+helpers and the conformance kit.
 
 ---
 

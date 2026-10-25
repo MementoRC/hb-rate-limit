@@ -30,13 +30,14 @@ class RateLimitPoolConflictError(ValueError):
         requested: RateLimit,
         existing_owner: str | None = None,
         requested_owner: str | None = None,
+        detail: str = "",
     ) -> None:
         by = f" (registered by {existing_owner})" if existing_owner else ""
         asker = f" by {requested_owner}" if requested_owner else ""
         super().__init__(
             f"Rate-limit pool {pool!r} already has limit {existing}{by}; "
             f"conflicting limit {requested} requested{asker}. "
-            "Everything sharing a pool must declare identical limits."
+            f"{detail}Everything sharing a pool must declare identical limits."
         )
         self.pool = pool
         self.existing = existing
