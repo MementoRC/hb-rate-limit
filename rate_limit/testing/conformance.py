@@ -994,15 +994,22 @@ async def _refund_is_idempotent(
 async def _refund_leaves_other_charges(
     make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
 ) -> None:
-    clock = ManualClock(_START)
-    limiter = make([_refund_limit()], clock, clock.sleep)
-    first = await limiter.reserve("a")
-    clock.advance(1.0)
-    await limiter.reserve("a")
-    first.refund()
-    _require(limiter.try_acquire("a") == 0.0, "refunding the first charge frees one slot")
-    wait = limiter.try_acquire("a")
-    _require(_close(wait, _REFUND_INTERVAL), f"the second charge must still count: wait {wait}")
+    # window: the second charge expires a full interval after it; bucket: refunding the first
+    # leaves exactly one token (the refill during the 1s gap is not credited twice)
+    cases: list[tuple[PoolKind, float]] = [
+        ("window", _REFUND_INTERVAL),
+        ("token_bucket", _REFUND_INTERVAL / 2),
+    ]
+    for kind, expected in cases:
+        clock = ManualClock(_START)
+        limiter = make([_refund_limit(kind)], clock, clock.sleep)
+        first = await limiter.reserve("a")
+        clock.advance(1.0)
+        await limiter.reserve("a")
+        first.refund()
+        _require(limiter.try_acquire("a") == 0.0, f"refunding a first {kind} charge frees one")
+        wait = limiter.try_acquire("a")
+        _require(_close(wait, expected), f"the second {kind} charge must still count: {wait}")
 
 
 async def _refund_after_expiry_is_a_noop(

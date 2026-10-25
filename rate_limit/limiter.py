@@ -34,7 +34,7 @@ from rate_limit.errors import (
     RateLimitWeightError,
     UnknownRateLimitError,
 )
-from rate_limit.pools import Pool, carry_over, new_pool
+from rate_limit.pools import Pool, SlidingWindowPool, TokenBucketPool, carry_over, new_pool
 from rate_limit.types import Clock, RateLimit, RateLimitLike, Sleep, check_weight, coerce_limit
 
 if TYPE_CHECKING:
@@ -96,8 +96,9 @@ class RateLimiter:
         self._scaled: dict[str, RateLimit] = {}
         self._owners: dict[str, str | None] = {}
         self._pools: dict[str, Pool] = {}
-        # pool generation per id: new on install, removal or kind change, kept by a same-kind
-        # rebuild; drawn from one counter so a removed then re-added id never reuses one
+        # pool generation per id: new on install, removal, kind change or bucket refill-rate
+        # change, kept by any other same-kind rebuild (see ``_keeps_charges``); drawn from one
+        # counter so a removed then re-added id never reuses one
         self._generations: dict[str, int] = {}
         self._next_generation = itertools.count()
         self._states: dict[str, PauseState] = {}
@@ -167,7 +168,7 @@ class RateLimiter:
                 scaled = self._scaled[limit_id]
                 old_pool = old_pools.get(limit_id)
                 if old_pool is not None:
-                    self._pools[limit_id] = carry_over(
+                    pool = self._pools[limit_id] = carry_over(
                         old_pool,
                         scaled.kind,
                         scaled.limit,
@@ -175,10 +176,21 @@ class RateLimiter:
                         self._margin,
                         now,
                     )
-                    if old_scaled[limit_id].kind == scaled.kind:  # same-kind rebuild: same charges
+                    if self._keeps_charges(old_pool, pool):
                         self._generations[limit_id] = old_generations[limit_id]
                 if old_scaled.get(limit_id) == scaled:
                     self._owners[limit_id] = old_owners.get(limit_id)
+
+    @staticmethod
+    def _keeps_charges(old: Pool, new: Pool) -> bool:
+        """Whether charges taken on ``old`` stay refundable on its rebuild ``new``.
+
+        A window rebuild shares the history, and a refund removes an exact entry. A bucket
+        refund assumes one refill rate since the charge, so a rate change (either way) ends it.
+        """
+        if isinstance(old, TokenBucketPool) and isinstance(new, TokenBucketPool):
+            return old.refill_per_second == new.refill_per_second
+        return isinstance(old, SlidingWindowPool) and isinstance(new, SlidingWindowPool)
 
     def _install(self, raw: RateLimit, owner: str | None) -> None:
         scaled = raw.scaled(self._pct)
@@ -407,7 +419,10 @@ class RateLimiter:
 
         With ``refund_on_error``, a body raising an :class:`Exception` refunds the charge before
         the exception propagates. A ``BaseException`` such as ``CancelledError`` keeps it: the
-        request may already have gone out.
+        request may already have gone out. Opt in only for bodies that fail before the request
+        reaches the venue (signing, validation): an exception after sending (a 429, a response
+        timeout, a parse error) means the venue already counted it, so a refund under-throttles;
+        there, use :meth:`reserve` and refund explicitly.
         """
         self._validate(limit_id, weights)
         return _TaskContext(self, limit_id, weights, refund_on_error)

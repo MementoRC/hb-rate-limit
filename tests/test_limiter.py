@@ -1015,7 +1015,7 @@ class TestRefund:
     async def test_bucket_refund_survives_a_same_kind_set_limits(self, clock: ManualClock) -> None:
         rl = make(clock, bucket("a", 4, 4))
         charge = await rl.reserve("a", {"a": 4})
-        rl.set_limits([bucket("a", 4, 8)])
+        rl.set_limits([bucket("a", 4, 4)])  # identical definition: a rebuild, same rate
         charge.refund()
         assert rl.try_acquire("a", {"a": 4}) == 0.0
 
@@ -1035,6 +1035,33 @@ class TestRefund:
         charge.refund()
         assert charge.refunded
         assert rl._pools["a"].used == pytest.approx(1.0)
+
+    async def test_bucket_refill_rate_change_ends_refunds(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 10, 1))
+        early = await rl.reserve("a", {"a": 5})
+        clock.advance(0.5)  # full again
+        await rl.reserve("a", {"a": 10})
+        rl.set_limits([bucket("a", 10, 100)])  # refill 10/s -> 0.1/s
+        early.refund()  # the current rate would credit 4.95
+        assert rl._pools["a"].used == 10
+
+    async def test_bucket_rebuild_at_the_same_refill_rate_refunds(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 10, 1))
+        charge = await rl.reserve("a", {"a": 4})
+        rl.set_limits([bucket("a", 20, 2)])  # still 10/s
+        charge.refund()
+        assert rl._pools["a"].used == 0
+
+    async def test_window_interval_change_refunds_exactly(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 2, 10))
+        charge = await rl.reserve("a")
+        clock.advance(1)
+        await rl.reserve("a")
+        rl.set_limits([RateLimit("a", 2, 20)])
+        charge.refund()
+        assert rl._pools["a"].used == 1
+        assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == pytest.approx(20.0)  # the second charge, stamped 1001
 
     async def test_kind_round_trip_at_the_same_time_is_a_noop(self, clock: ManualClock) -> None:
         rl = make(clock, RateLimit("a", 2, 10))

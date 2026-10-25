@@ -82,10 +82,15 @@ limiter.unpause("feed")  # or limiter.unpause_all()
 `reserve()` waits exactly like `acquire()` but returns a `Charge` receipt. If the request never
 went out (signing failed, say), `charge.refund()` hands the capacity back on every pool it
 charged. A refund is idempotent and thread-safe; it is skipped for a limit id that has since been
-removed (even if re-added) or changed kind, and an expired charge gives nothing back. A token
-bucket does not track individual charges, so it returns only the part that cannot have refilled
-yet, `min(used, cost - refill * elapsed)`, which never over-credits. Waiters are not woken early:
-they pick up the capacity when they next re-assess.
+removed (even if re-added) or changed kind or refill rate, and an expired charge gives nothing
+back. A token bucket does not track individual charges, so it returns only the part that cannot
+have refilled yet, `min(used, cost - refill * elapsed)`, which never over-credits. Waiters are
+not woken early: they pick up the capacity when they next re-assess.
+
+Use `refund_on_error=True` only for bodies that fail before the request reaches the venue
+(signing, validation). An exception raised after sending (a 429, a response timeout, a parse
+error) means the venue already counted the request, so refunding under-throttles; there, use
+`reserve()` and refund explicitly.
 
 ```python
 charge = await limiter.reserve("klines")
@@ -98,7 +103,8 @@ await send(signed)
 
 # or let the context manager do it: an Exception in the body refunds, cancellation does not
 async with limiter.execute_task("klines", refund_on_error=True):
-    await send(sign(order))
+    signed = sign(order)  # only pre-send work in here
+await send(signed)
 ```
 
 `limiter.bind("klines").reserve()` does the same with the bound weights.

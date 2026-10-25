@@ -216,8 +216,9 @@ class TokenBucketPool:
 
         A bucket keeps no per-charge record, so this bounds the charge's remaining effect: the gap
         between the never-charged and the actual bucket starts at ``cost`` and only shrinks, at
-        most at the refill rate, while the never-charged one sits at capacity. So it never
-        over-credits, and it is exact when no clamping happened in between.
+        most at the refill rate, while the never-charged one sits at capacity. Provided the rate
+        was fixed since ``stamp`` (the limiter ends a charge's refundability when it changes),
+        it never over-credits, and it is exact when no clamping happened in between.
         """
         self.evict(now)
         unrefilled = max(0.0, cost - self._refill * max(0.0, now - stamp))
