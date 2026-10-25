@@ -178,6 +178,8 @@ Intentional behaviour changes:
 
 ## Status
 
+v0.4.0: adds `rate_limit.hb_compat`, the hummingbot `AsyncThrottler` drop-in; no core change.
+
 v0.3.0: ships `py.typed`; refund receipts, where `RateLimiter.reserve()` / `BoundLimiter.reserve()`
 return a `Charge` with `refund()`, plus `execute_task(..., refund_on_error=True)` and an opt-in
 `refundable` conformance suite; `KeyedCooldown` for per-key windows; `BoundLimiter.paused_until()`
