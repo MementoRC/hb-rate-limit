@@ -244,6 +244,59 @@ class TestUnpausableLimiter:
             note_rate_limited(self.AcquireOnly(), RateLimitExceededError(status=418))  # type: ignore[arg-type]
         assert "AcquireOnly" in caplog.text
 
+    def test_non_weakrefable_pausable_limiter_is_memoryless(self) -> None:
+        class SlottedPausable:
+            __slots__ = ("paused",)
+
+            def __init__(self) -> None:
+                self.paused: list[float] = []
+
+            async def acquire(self) -> None:
+                return None
+
+            def pause(self, seconds: float) -> None:
+                self.paused.append(seconds)
+
+        limiter = SlottedPausable()
+        error = RateLimitExceededError(status=429)
+        note_rate_limited(limiter, error)
+        note_rate_limited(limiter, error)  # no remembered pause or streak: nothing escalates
+        assert limiter.paused == [5.0, 5.0]
+
+    def test_limiter_own_backoff_policy_is_used(self) -> None:
+        class WithPolicy(self.PauseOnly):
+            def __init__(self) -> None:
+                super().__init__()
+                self.backoff = BackoffPolicy()
+
+        limiter = WithPolicy()
+        note_rate_limited(limiter, RateLimitExceededError(status=429))
+        assert limiter.backoff.streak == 1
+        assert limiter not in helpers._FALLBACK_POLICIES
+        note_request_succeeded(limiter)
+        assert limiter.backoff.streak == 0
+
+    def test_limiter_with_is_paused_keeps_no_own_pause_deadline(self) -> None:
+        class Reporting(self.PauseOnly):
+            paused_now = False
+
+            def is_paused(self) -> bool:
+                return self.paused_now
+
+        limiter = Reporting()
+        error = RateLimitExceededError(status=429)
+        note_rate_limited(limiter, error)
+        assert limiter.paused == [5.0]
+        assert limiter not in helpers._OWN_PAUSE_DEADLINES
+        limiter.paused_now = True  # burst detection comes from is_paused(), not the helper
+        note_rate_limited(limiter, error)
+        assert limiter.paused == [5.0]
+
+    def test_success_without_any_policy_is_a_noop(self) -> None:
+        limiter = self.AcquireOnly()
+        note_request_succeeded(limiter)  # type: ignore[arg-type]
+        assert limiter not in helpers._FALLBACK_POLICIES
+
 
 class TestRunPacedLimit:
     async def test_success_and_weights(self, clock: ManualClock) -> None:
