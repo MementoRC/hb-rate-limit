@@ -13,6 +13,7 @@ import pytest
 from rate_limit import (
     BackoffPolicy,
     BoundLimiter,
+    Charge,
     LinkedLimitWeightPair,
     PausableRateLimiterProtocol,
     PoolPauseProtocol,
@@ -952,6 +953,174 @@ class TestMustInvariants:
         assert len(reserved) == 6
         reserved.sort()
         assert all(reserved[i + 2] - reserved[i] >= interval for i in range(4))
+
+
+class TestRefund:
+    async def test_reserve_returns_a_read_only_receipt(self, clock: ManualClock) -> None:
+        rl = make(
+            clock,
+            RateLimit("a", 2, 10, linked_limits=[LinkedLimitWeightPair("s")]),
+            RateLimit("s", 5, 10),
+        )
+        charge = await rl.reserve("a", {"s": 3})
+        assert isinstance(charge, Charge)
+        assert (charge.limit_id, dict(charge.costs), charge.stamp) == ("a", {"a": 1, "s": 3}, 1000)
+        assert not charge.refunded
+        with pytest.raises(TypeError):
+            charge.costs["a"] = 2  # type: ignore[index]
+        charge.refund()
+        assert charge.refunded
+        assert (rl._pools["a"].used, rl._pools["s"].used) == (0, 0)
+
+    async def test_reserve_waits_like_acquire(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        await rl.reserve("a")
+        rl.pause("a", 15)
+        charge = await rl.reserve("a")
+        assert clock.sleeps == [pytest.approx(15.0)]
+        assert charge.stamp == pytest.approx(1015.0)
+        await rl.reserve("a")
+        assert clock.sleeps == [pytest.approx(15.0), pytest.approx(10.0)]
+
+    async def test_acquire_is_unchanged(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 2, 10))
+        assert await rl.acquire("a", {"a": 2}) is None
+        assert rl.try_acquire("a") == pytest.approx(10.0)
+
+    async def test_double_refund_credits_once(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 4, 4))
+        charge = await rl.reserve("a", {"a": 2})
+        await rl.reserve("a", {"a": 2})
+        charge.refund()
+        charge.refund()
+        assert rl._pools["a"].used == 2
+
+    async def test_concurrent_refunds_credit_once(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 4, 4))
+        charge = await rl.reserve("a", {"a": 2})
+        await rl.reserve("a", {"a": 2})
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda _: charge.refund(), range(8)))
+        assert rl._pools["a"].used == 2
+
+    async def test_refund_survives_a_same_kind_set_limits(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        charge = await rl.reserve("a")
+        rl.set_limits([RateLimit("a", 2, 10)])
+        charge.refund()
+        assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == 0.0
+        assert rl.try_acquire("a") == pytest.approx(10.0)
+
+    async def test_bucket_refund_survives_a_same_kind_set_limits(self, clock: ManualClock) -> None:
+        rl = make(clock, bucket("a", 4, 4))
+        charge = await rl.reserve("a", {"a": 4})
+        rl.set_limits([bucket("a", 4, 8)])
+        charge.refund()
+        assert rl.try_acquire("a", {"a": 4}) == 0.0
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            (RateLimit("a", 2, 10), bucket("a", 2, 10)),
+            (bucket("a", 2, 10), RateLimit("a", 2, 10)),  # carry-over equals the charge
+        ],
+    )
+    async def test_kind_change_makes_refund_a_noop(
+        self, clock: ManualClock, before: RateLimit, after: RateLimit
+    ) -> None:
+        rl = make(clock, before)
+        charge = await rl.reserve("a")
+        rl.set_limits([after])
+        charge.refund()
+        assert charge.refunded
+        assert rl._pools["a"].used == pytest.approx(1.0)
+
+    async def test_removed_limit_is_skipped(self, clock: ManualClock) -> None:
+        rl = make(
+            clock,
+            RateLimit("a", 1, 10, linked_limits=[LinkedLimitWeightPair("s")]),
+            RateLimit("s", 1, 10),
+        )
+        charge = await rl.reserve("a")
+        rl.set_limits([RateLimit("a", 1, 10)])  # "s" is gone
+        charge.refund()
+        assert rl.try_acquire("a") == 0.0
+
+        rl = make(clock, RateLimit("a", 1, 10))
+        charge = await rl.reserve("a")
+        rl.set_limits([])
+        charge.refund()  # nothing left to refund into
+        assert charge.refunded
+
+    async def test_unknown_allow_mode_gives_an_empty_charge(self, clock: ManualClock) -> None:
+        rl = make(clock, unknown="allow")
+        charge = await rl.reserve("nope")
+        assert dict(charge.costs) == {}
+        charge.refund()
+        assert charge.refunded
+
+    async def test_refund_does_not_wake_a_waiter(self, clock: ManualClock) -> None:
+        sleeper = BlockingSleep()
+        rl = RateLimiter([RateLimit("a", 1, 10)], clock=clock, sleep=sleeper)
+        charge = await rl.reserve("a")
+        task = asyncio.create_task(rl.acquire("a"))
+        await sleeper.started.wait()
+        charge.refund()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not task.done()  # it sees the capacity only when its sleep ends
+        assert rl.try_acquire("a") == 0.0
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def test_bound_reserve_uses_bound_weights(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 10, 1))
+        bound = rl.bind("a", {"a": 4})
+        charge = await bound.reserve()
+        assert dict(charge.costs) == {"a": 4}
+        assert rl._pools["a"].used == 4
+        charge.refund()
+        assert rl._pools["a"].used == 0
+
+
+class TestRefundOnError:
+    async def test_exception_refunds_and_propagates(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        with pytest.raises(RuntimeError, match="sign"):
+            async with rl.execute_task("a", refund_on_error=True):
+                raise RuntimeError("sign failed")
+        assert rl.try_acquire("a") == 0.0
+
+    async def test_success_keeps_the_charge(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        async with rl.execute_task("a", refund_on_error=True):
+            pass
+        assert rl.try_acquire("a") == pytest.approx(10.0)
+
+    async def test_off_by_default(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        with pytest.raises(RuntimeError):
+            async with rl.execute_task("a"):
+                raise RuntimeError("sign failed")
+        assert rl.try_acquire("a") == pytest.approx(10.0)
+
+    async def test_cancellation_keeps_the_charge(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 1, 10))
+        entered = asyncio.Event()
+
+        async def body() -> None:
+            async with rl.execute_task("a", refund_on_error=True):
+                entered.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(body())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert rl.try_acquire("a") == pytest.approx(10.0)  # the request may have gone out
 
 
 class TestBackoffHooks:

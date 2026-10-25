@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -7,6 +7,7 @@ import pytest
 
 from rate_limit import (
     BackoffPolicy,
+    Charge,
     PausableRateLimiterProtocol,
     RateLimit,
     RateLimiter,
@@ -18,6 +19,7 @@ from rate_limit.testing import (
     BoundUnpausableLimiter,
     KindChangeLimiter,
     ManualClock,
+    RefundableLimiter,
     RetryAfterCapLimiter,
     UnpausableLimiter,
     assert_conforms_backoff,
@@ -25,6 +27,7 @@ from rate_limit.testing import (
     assert_conforms_bound_unpausable,
     assert_conforms_kind_change,
     assert_conforms_pausable,
+    assert_conforms_refundable,
     assert_conforms_rest_limiter,
     assert_conforms_retry_after_cap,
     assert_conforms_throttler,
@@ -115,6 +118,27 @@ def test_kind_change_conformance() -> None:
         return RateLimiter(limits, clock=clock, sleep=sleep)
 
     assert_conforms_kind_change(make)
+
+
+def test_refundable_conformance() -> None:
+    def make(limits: Sequence[RateLimit], clock: Clock, sleep: Sleep) -> RefundableLimiter:
+        return RateLimiter(limits, clock=clock, sleep=sleep)
+
+    assert_conforms_refundable(make)
+
+
+def test_conformance_detects_a_refund_that_returns_nothing() -> None:
+    class Hollow(Charge):
+        def refund(self) -> None:
+            return None
+
+    class Keeps(RateLimiter):
+        async def reserve(self, limit_id: str, weights: Mapping[str, int] | None = None) -> Charge:
+            charge = await super().reserve(limit_id, weights)
+            return Hollow(self, charge.limit_id, charge.costs, {}, charge.stamp)
+
+    with pytest.raises(AssertionError, match="refund"):
+        assert_conforms_refundable(lambda limits, c, s: Keeps(limits, clock=c, sleep=s))
 
 
 def test_conformance_detects_a_limiter_that_drops_usage_on_set_limits() -> None:
@@ -261,6 +285,7 @@ def test_plugin_fixtures(manual_clock: ManualClock, conformance_suites: SimpleNa
     assert conformance_suites.bound_unpausable is assert_conforms_bound_unpausable
     assert conformance_suites.bound_retry_after_cap is assert_conforms_bound_retry_after_cap
     assert conformance_suites.kind_change is assert_conforms_kind_change
+    assert conformance_suites.refundable is assert_conforms_refundable
 
 
 def test_manual_clock() -> None:

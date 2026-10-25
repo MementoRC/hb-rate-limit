@@ -77,22 +77,49 @@ limiter.report_response("feed", 429, {"Retry-After": "7200"})  # paused for 120s
 limiter.unpause("feed")  # or limiter.unpause_all()
 ```
 
+### Refunding a charge
+
+`reserve()` waits exactly like `acquire()` but returns a `Charge` receipt. If the request never
+went out (signing failed, say), `charge.refund()` hands the capacity back on every pool it
+charged. A refund is idempotent and thread-safe; it is skipped for a limit id that has since been
+removed or changed kind, and a window charge that has already expired gives nothing back. A
+token bucket does not track individual charges, so it returns `min(cost, used)`. Waiters are not
+woken early: they pick up the capacity when they next re-assess.
+
+```python
+charge = await limiter.reserve("klines")
+try:
+    signed = sign(order)
+except SigningError:
+    charge.refund()  # nothing was sent: give the weight back
+    raise
+await send(signed)
+
+# or let the context manager do it: an Exception in the body refunds, cancellation does not
+async with limiter.execute_task("klines", refund_on_error=True):
+    await send(sign(order))
+```
+
+`limiter.bind("klines").reserve()` does the same with the bound weights.
+
 Share one budget across instances with `get_pool_limiter(pool_key, limit)`; the kind and
 `safety_margin_pct` (default 0.0; hb_compat shims pass 0.05) are part of the pool's identity.
 The `run_paced` / `note_rate_limited` helpers take an optional `clock=` for limiters that can
 pause but cannot report `is_paused()`. Tests use `rate_limit.testing.ManualClock` and the
-`assert_conforms_*` suites. Four opt-in suites cover features that are not part of the
-required protocols; run one only if your limiter claims the feature (each is also a
+`assert_conforms_*` suites. Opt-in suites cover features that are not part of the required
+protocols; run one only if your limiter claims the feature (each is also a
 `conformance_suites` fixture attribute): `assert_conforms_token_bucket(make)` with
 `make(limits, clock, sleep)`, `assert_conforms_unpausable(make)` with `make(limits, clock, sleep)`
 (driven by `rate_limit.testing.BlockingSleep`), `assert_conforms_retry_after_cap(make)` with
-`make(cap, clock, backoff_factory)`, and `assert_conforms_kind_change(make)` with
-`make(limits, clock, sleep)` (`set_limits` carries usage across a window / token-bucket switch).
+`make(cap, clock, backoff_factory)`, `assert_conforms_kind_change(make)` with
+`make(limits, clock, sleep)` (`set_limits` carries usage across a window / token-bucket switch),
+and `assert_conforms_refundable(make)` with `make(limits, clock, sleep)` (`reserve()` returns a
+charge whose `refund()` frees its capacity at once, exactly once, on every linked pool).
 For a limiter bound to one limit id (`limiter.bind("x")`, which also forwards `paused_until()`
 and `report_throttled(retry_after, status=)`), `assert_conforms_bound_unpausable(make)` with
 `make(limit, clock, sleep)` and `assert_conforms_bound_retry_after_cap(make)` with
 `make(cap, clock, backoff_factory)` run the same scenarios; the bound unpausable suite skips the
-`pause_all` and multi-id ones.
+`pause_all` and multi-id ones and checks the bound `unpause_all()` instead.
 
 ---
 
@@ -106,7 +133,8 @@ helpers and the conformance kit.
 Unreleased: the conformance kit gains opt-in `token_bucket`, `unpausable`, `retry_after_cap` and
 `kind_change` suites (plus `BlockingSleep`), closing the v0.2 kit gap, and bound-limiter
 variants `bound_unpausable` and `bound_retry_after_cap`; `BoundLimiter` gains `paused_until()` and
-`report_throttled()`.
+`report_throttled()`. Refund receipts: `reserve()` returns a `Charge` with `refund()`,
+`execute_task(..., refund_on_error=True)`, and an opt-in `refundable` suite.
 
 ---
 

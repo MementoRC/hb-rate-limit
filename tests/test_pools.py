@@ -205,6 +205,88 @@ class TestCarryOver:
         assert (pool.capacity, pool.used) == (4, 1)
 
 
+class TestWindowRefund:
+    def test_removes_the_exact_entry(self) -> None:
+        pool = SlidingWindowPool(10, 10.0)
+        pool.reserve(3, 0.0)
+        pool.reserve(2, 1.0)
+        assert pool.refund(3, 0.0, 2.0) == 3.0
+        assert pool.used == 2
+        assert pool.wait_for(9, 2.0) == pytest.approx(9.0)  # only the 1.0 entry is left
+
+    def test_duplicate_stamps_lose_one_entry_per_refund(self) -> None:
+        pool = SlidingWindowPool(10, 10.0)
+        pool.reserve(2, 0.0)
+        pool.reserve(2, 0.0)
+        assert pool.refund(2, 0.0, 0.0) == 2.0
+        assert pool.used == 2
+        assert pool.refund(2, 0.0, 0.0) == 2.0
+        assert pool.refund(2, 0.0, 0.0) == 0.0
+        assert pool.used == 0
+
+    def test_needs_both_stamp_and_cost_to_match(self) -> None:
+        pool = SlidingWindowPool(10, 10.0)
+        pool.reserve(2, 0.0)
+        assert pool.refund(3, 0.0, 0.0) == 0.0
+        assert pool.refund(2, 0.5, 0.0) == 0.0
+        assert pool.used == 2
+
+    def test_charge_at_the_boundary_still_refunds(self) -> None:
+        pool = SlidingWindowPool(10, 10.0)
+        pool.reserve(4, 0.0)
+        assert pool.refund(4, 0.0, 10.0) == 4.0  # age == window still counts
+        assert pool.used == 0
+
+    def test_expired_charge_returns_nothing(self) -> None:
+        pool = SlidingWindowPool(10, 10.0)
+        pool.reserve(4, 0.0)
+        pool.reserve(4, 10.001)
+        assert pool.refund(4, 0.0, 10.001) == 0.0
+        assert pool.used == 4
+
+    def test_survives_a_same_kind_rebuild(self) -> None:
+        pool = SlidingWindowPool(2, 10.0)
+        pool.reserve(1, 0.0)
+        rebuilt = carry_over(pool, "window", 5, 10.0, 0.0, 1.0)
+        assert rebuilt.refund(1, 0.0, 1.0) == 1.0
+        assert rebuilt.used == 0
+
+    def test_bucket_carry_over_replaces_the_entry(self) -> None:
+        old = TokenBucketPool(5, 1)
+        old.evict(0.0)
+        old.reserve(2, 0.0)
+        pool = carry_over(old, "window", 5, 10.0, 0.0, 0.5)  # one charge of ceil(1.5) == 2
+        assert pool.refund(2, 0.0, 0.5) == 0.0
+        assert pool.used == 2
+
+
+class TestBucketRefund:
+    def test_returns_the_cost(self) -> None:
+        pool = TokenBucketPool(10, 1)
+        pool.evict(0.0)
+        pool.reserve(4, 0.0)
+        assert pool.refund(4, 0.0, 0.0) == 4.0
+        assert pool.used == 0
+
+    def test_clamps_at_capacity(self) -> None:
+        pool = TokenBucketPool(10, 1)
+        pool.evict(0.0)
+        pool.reserve(4, 0.0)
+        assert pool.refund(4, 0.0, 3.0) == pytest.approx(1.0)  # 3 of the 4 already refilled
+        assert pool.used == 0
+        assert pool.refund(4, 0.0, 3.0) == 0.0
+        assert pool.used == 0
+        assert pool.wait_for(10, 3.0) == 0.0
+
+    def test_is_approximate_and_ignores_the_stamp(self) -> None:
+        pool = TokenBucketPool(10, 1)
+        pool.evict(0.0)
+        pool.reserve(4, 0.0)
+        pool.reserve(4, 2.0)  # deficit 6: 2 of the first charge refilled meanwhile
+        assert pool.refund(4, 123.0, 2.0) == 4.0  # min(cost, used), not the unrefilled 2
+        assert pool.used == pytest.approx(2.0)
+
+
 class TestNewPool:
     def test_bucket_refill_is_limit_over_margined_interval(self) -> None:
         pool = new_pool("token_bucket", 10, 5.0, 0.25)

@@ -1,9 +1,11 @@
 """Weighted sliding-window limiter over linked pools.
 
 Concurrency model: all accounting lives behind one ``threading.Lock`` that is held only for
-synchronous check-and-record steps. ``acquire`` never sleeps (or awaits) while holding it,
-so waiters on any number of event loops and threads share one history without serialising
-behind a sleeper. A cancelled ``acquire`` has recorded nothing.
+synchronous check-and-record steps. ``acquire`` / ``reserve`` never sleep (or await) while
+holding it, so waiters on any number of event loops and threads share one history without
+serialising behind a sleeper. A cancelled ``acquire`` has recorded nothing. A
+:meth:`Charge.refund` takes the same lock and wakes nobody: waiters see the returned capacity
+when they next re-assess.
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 CAPACITY_WARN_INTERVAL_SECONDS = 30.0
 CAPACITY_WARN_FRACTION = 0.9
 
-__all__ = ["BoundLimiter", "Clock", "RateLimiter", "Sleep"]
+__all__ = ["BoundLimiter", "Charge", "Clock", "RateLimiter", "Sleep"]
 
 
 class RateLimiter:
@@ -286,12 +288,13 @@ class RateLimiter:
 
     def _try_reserve(
         self, limit_id: str, weights: Mapping[str, int] | None, deadline: float, record: bool
-    ) -> tuple[float, float, bool]:
+    ) -> tuple[float, float, bool, Charge | None]:
         """One synchronous pause-check-and-record step; never awaits.
 
-        Returns ``(wait, now, paused)``. When recording, an active pause short-circuits
+        Returns ``(wait, now, paused, charge)``. When recording, an active pause short-circuits
         before the window is touched (``paused=True``, nothing recorded); unknown ids in
-        "allow" mode skip the window but still honour pauses.
+        "allow" mode skip the window but still honour pauses. ``charge`` is the receipt once
+        something was recorded (empty for an unthrottled call), else None.
         """
         warnings: list[str] = []
         try:
@@ -300,31 +303,48 @@ class RateLimiter:
                 plan = self._plan(limit_id, weights, warnings)
                 pause_wait = max(0.0, self._paused_until_locked(limit_id) - now)
                 if record and pause_wait > 0.0:
-                    return pause_wait, now, True
+                    return pause_wait, now, True, None
                 window_wait = 0.0
                 if plan is not None:
                     through = deadline if now >= deadline else -math.inf
                     window_wait = self._assess(plan, now, through, record)
                     if record and window_wait == 0.0:
                         warnings.extend(self._near_capacity(plan, now))
+                charge = None
+                if record and window_wait == 0.0:
+                    charge = self._receipt(limit_id, plan or [], now)
         finally:
             for message in warnings:
                 logger.warning(message)
-        return max(pause_wait, window_wait), now, False
+        return max(pause_wait, window_wait), now, False, charge
+
+    def _receipt(self, limit_id: str, plan: list[tuple[str, int]], now: float) -> Charge:
+        """The receipt for ``plan`` just recorded at ``now`` (lock held)."""
+        kinds = {charge_id: type(self._pools[charge_id]) for charge_id, _ in plan}
+        return Charge(self, limit_id, dict(plan), kinds, now)
 
     # ---- acquire --------------------------------------------------------------------
 
     async def acquire(self, limit_id: str, weights: Mapping[str, int] | None = None) -> None:
         """Wait out pauses and the window, then record the charge.
 
+        :meth:`reserve` without the receipt: sleeps happen outside every lock, cancelling
+        records nothing, and an unpause ends a sleep spent in a pause early.
+        """
+        await self.reserve(limit_id, weights)
+
+    async def reserve(self, limit_id: str, weights: Mapping[str, int] | None = None) -> Charge:
+        """Wait out pauses and the window, record the charge, and return its :class:`Charge`.
+
         Sleeps happen outside every lock; cancelling records nothing. A sleep spent in a pause
-        ends early when :meth:`unpause` / :meth:`unpause_all` lifts it, and the acquire re-assesses.
+        ends early when :meth:`unpause` / :meth:`unpause_all` lifts it, and the call re-assesses.
+        An unknown id in "allow" mode returns an empty charge, whose refund is a no-op.
         """
         deadline = -math.inf
         while True:
-            wait, now, paused = self._try_reserve(limit_id, weights, deadline, record=True)
-            if wait == 0.0:
-                return
+            wait, now, paused, charge = self._try_reserve(limit_id, weights, deadline, record=True)
+            if charge is not None:
+                return charge
             if paused:
                 await self._sleep_unless_unpaused(limit_id, wait)
                 continue
@@ -367,11 +387,20 @@ class RateLimiter:
                 loop.call_soon_threadsafe(event.set)
 
     def execute_task(
-        self, limit_id: str, *, weights: Mapping[str, int] | None = None
+        self,
+        limit_id: str,
+        *,
+        weights: Mapping[str, int] | None = None,
+        refund_on_error: bool = False,
     ) -> AbstractAsyncContextManager[None]:
-        """Async context manager that acquires on entry; exit is a no-op."""
+        """Async context manager that reserves on entry; exit is a no-op by default.
+
+        With ``refund_on_error``, a body raising an :class:`Exception` refunds the charge before
+        the exception propagates. A ``BaseException`` such as ``CancelledError`` keeps it: the
+        request may already have gone out.
+        """
         self._validate(limit_id, weights)
-        return _TaskContext(self, limit_id, weights)
+        return _TaskContext(self, limit_id, weights, refund_on_error)
 
     def try_acquire(self, limit_id: str, weights: Mapping[str, int] | None = None) -> float:
         """Non-blocking: 0.0 = reserved, else seconds to wait (nothing recorded)."""
@@ -535,16 +564,83 @@ class RateLimiter:
                 state.backoff.reset()
 
 
+class Charge:
+    """Receipt for one :meth:`RateLimiter.reserve`: the cost charged to each pool, and when.
+
+    :meth:`refund` hands that capacity back, e.g. when signing failed and the request never went
+    out. A refund does not wake waiters early: they pick up the returned capacity when they next
+    re-assess.
+    """
+
+    def __init__(
+        self,
+        limiter: RateLimiter,
+        limit_id: str,
+        costs: Mapping[str, int],
+        kinds: Mapping[str, type[Pool]],
+        stamp: float,
+    ) -> None:
+        self._limiter = limiter
+        self._limit_id = limit_id
+        self._costs = MappingProxyType(dict(costs))
+        self._kinds = dict(kinds)  # pool class charged, so a kind change skips the refund
+        self._stamp = stamp
+        self._refunded = False
+
+    @property
+    def limit_id(self) -> str:
+        return self._limit_id
+
+    @property
+    def costs(self) -> Mapping[str, int]:
+        """Pool id -> cost charged; empty for an unknown id run unthrottled in "allow" mode."""
+        return self._costs
+
+    @property
+    def stamp(self) -> float:
+        """Clock time the charge was recorded at."""
+        return self._stamp
+
+    @property
+    def refunded(self) -> bool:
+        return self._refunded
+
+    def refund(self) -> None:
+        """Return the charge to every pool it touched; idempotent and thread-safe.
+
+        A pool is skipped when its limit id has since been removed, or ``set_limits`` changed
+        its kind. A window gives the charge back only while it still counts; a bucket returns
+        ``min(cost, used)`` (see :meth:`TokenBucketPool.refund`). Waiters are not woken early:
+        they pick up the returned capacity when they next re-assess.
+        """
+        limiter = self._limiter
+        with limiter._lock:
+            if self._refunded:
+                return
+            self._refunded = True
+            now = limiter._clock()
+            for pool_id, cost in self._costs.items():
+                pool = limiter._pools.get(pool_id)
+                if pool is not None and type(pool) is self._kinds[pool_id]:
+                    pool.refund(cost, self._stamp, now)
+
+
 class _TaskContext:
     def __init__(
-        self, limiter: RateLimiter, limit_id: str, weights: Mapping[str, int] | None
+        self,
+        limiter: RateLimiter,
+        limit_id: str,
+        weights: Mapping[str, int] | None,
+        refund_on_error: bool,
     ) -> None:
         self._limiter = limiter
         self._limit_id = limit_id
         self._weights = weights
+        self._refund_on_error = refund_on_error
+        self._charge: Charge | None = None
 
     async def __aenter__(self) -> None:
-        await self._limiter.acquire(self._limit_id, self._weights)
+        self._charge = await self._limiter.reserve(self._limit_id, self._weights)
 
     async def __aexit__(
         self,
@@ -552,7 +648,9 @@ class _TaskContext:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        return None
+        # Exception only: after a BaseException (e.g. cancellation) the request may have gone out
+        if self._refund_on_error and isinstance(exc, Exception) and self._charge is not None:
+            self._charge.refund()
 
 
 class BoundLimiter:
@@ -579,6 +677,9 @@ class BoundLimiter:
 
     async def acquire(self) -> None:
         await self._limiter.acquire(self._limit_id, self._weights)
+
+    async def reserve(self) -> Charge:
+        return await self._limiter.reserve(self._limit_id, self._weights)
 
     def pause(self, seconds: float) -> None:
         self._limiter.pause(self._limit_id, seconds)

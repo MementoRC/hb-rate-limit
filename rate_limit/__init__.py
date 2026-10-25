@@ -26,7 +26,7 @@ from rate_limit.helpers import (
     run_paced,
     run_paced_limit,
 )
-from rate_limit.limiter import BoundLimiter, RateLimiter
+from rate_limit.limiter import BoundLimiter, Charge, RateLimiter
 from rate_limit.pools import Pool, SlidingWindowPool, TokenBucketPool
 from rate_limit.protocols import (
     AsyncThrottlerProtocol,
@@ -57,6 +57,7 @@ __all__ = [
     "AsyncThrottlerProtocol",
     "BackoffPolicy",
     "BoundLimiter",
+    "Charge",
     "Clock",
     "LinkedLimitWeightPair",
     "PausableRateLimiterProtocol",

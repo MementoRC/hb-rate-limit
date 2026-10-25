@@ -26,7 +26,7 @@ from rate_limit.testing.clock import BlockingSleep, ManualClock
 from rate_limit.types import Clock, LinkedLimitWeightPair, RateLimit, Sleep
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable, Sequence
+    from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 
     from rate_limit.backoff import RateLimitVerdict
     from rate_limit.types import PoolKind, RateLimitLike
@@ -911,3 +911,129 @@ async def _kind_removed_id_starts_fresh(
     limiter.set_limits([_kind_limit("window"), _kind_limit("window", "other")])
     await _spend(limiter, _KIND_LIMIT)
     _require(clock.sleeps == [], "an id removed then re-added must start with a fresh pool")
+
+
+# ---- refunds ------------------------------------------------------------------------
+
+
+class RefundableCharge(Protocol):
+    """What :meth:`RefundableLimiter.reserve` returns (``Charge`` satisfies it)."""
+
+    def refund(self) -> None: ...
+
+
+class RefundableLimiter(Protocol):
+    """Opt-in surface for :func:`assert_conforms_refundable` (``RateLimiter`` satisfies it)."""
+
+    async def reserve(
+        self, limit_id: str, weights: Mapping[str, int] | None = None
+    ) -> RefundableCharge: ...
+
+    def try_acquire(self, limit_id: str, weights: Mapping[str, int] | None = None) -> float: ...
+
+
+def assert_conforms_refundable(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    """``reserve()`` returns a charge whose ``refund()`` hands its capacity straight back.
+
+    The factory must build a limiter with no safety margin; ``try_acquire`` returns 0.0 and
+    records when a call fits, else the wait. A refund frees capacity without the clock
+    advancing (window and token bucket), is idempotent, frees only its own charge, gives nothing
+    back once a window charge has expired, and reaches every linked pool.
+    """
+    _run(_refund_restores_capacity(make))
+    _run(_refund_is_idempotent(make))
+    _run(_refund_leaves_other_charges(make))
+    _run(_refund_after_expiry_is_a_noop(make))
+    _run(_refund_covers_linked_pools(make))
+
+
+_REFUND_INTERVAL = 10.0
+_REFUND_KINDS: tuple[PoolKind, ...] = ("window", "token_bucket")
+
+
+def _refund_limit(kind: PoolKind = "window") -> RateLimit:
+    return RateLimit("a", 2, _REFUND_INTERVAL, kind=kind)
+
+
+def _full(limiter: RefundableLimiter, what: str) -> None:
+    _require(limiter.try_acquire("a") > 0, f"{what}: the pool must be full")
+
+
+async def _refund_restores_capacity(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    for kind in _REFUND_KINDS:
+        clock = ManualClock(_START)
+        limiter = make([_refund_limit(kind)], clock, clock.sleep)
+        charge = await limiter.reserve("a")
+        await limiter.reserve("a")
+        _full(limiter, f"{kind} after two charges")
+        charge.refund()
+        _require(limiter.try_acquire("a") == 0.0, f"a {kind} refund must free its charge at once")
+        _full(limiter, f"a {kind} refund frees its own charge, no more")
+        _require(clock.sleeps == [], f"{kind}: nothing here may sleep: {clock.sleeps}")
+
+
+async def _refund_is_idempotent(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    for kind in _REFUND_KINDS:
+        clock = ManualClock(_START)
+        limiter = make([_refund_limit(kind)], clock, clock.sleep)
+        charge = await limiter.reserve("a")
+        await limiter.reserve("a")
+        charge.refund()
+        charge.refund()
+        _require(limiter.try_acquire("a") == 0.0, f"a {kind} refund must free its charge")
+        _full(limiter, f"a second {kind} refund must not credit again")
+
+
+async def _refund_leaves_other_charges(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    clock = ManualClock(_START)
+    limiter = make([_refund_limit()], clock, clock.sleep)
+    first = await limiter.reserve("a")
+    clock.advance(1.0)
+    await limiter.reserve("a")
+    first.refund()
+    _require(limiter.try_acquire("a") == 0.0, "refunding the first charge frees one slot")
+    wait = limiter.try_acquire("a")
+    _require(_close(wait, _REFUND_INTERVAL), f"the second charge must still count: wait {wait}")
+
+
+async def _refund_after_expiry_is_a_noop(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    clock = ManualClock(_START)
+    limiter = make([_refund_limit()], clock, clock.sleep)
+    stale = await limiter.reserve("a")
+    clock.advance(_REFUND_INTERVAL * 1.001)
+    await limiter.reserve("a")
+    await limiter.reserve("a")
+    stale.refund()
+    _full(limiter, "refunding an expired charge must not add headroom")
+
+
+async def _refund_covers_linked_pools(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    clock = ManualClock(_START)
+    link = [LinkedLimitWeightPair("shared", 1)]
+    limiter = make(
+        [
+            RateLimit("a", 1, _REFUND_INTERVAL, linked_limits=link),
+            RateLimit("b", 1, _REFUND_INTERVAL, linked_limits=link),
+            RateLimit("shared", 1, _REFUND_INTERVAL),
+        ],
+        clock,
+        clock.sleep,
+    )
+    charge = await limiter.reserve("a")
+    _require(limiter.try_acquire("b") > 0, "the linked pool must be charged")
+    charge.refund()
+    _require(
+        limiter.try_acquire("a") == 0.0, "the refund must reach the primary and the linked pool"
+    )
