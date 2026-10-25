@@ -42,9 +42,7 @@ async def tick(_seconds: float) -> None:
     await asyncio.sleep(0.001)
 
 
-def build(
-    limits: list[RateLimit], clock: ManualClock | None = None, **kwargs
-) -> AsyncThrottler:
+def build(limits: list[RateLimit], clock: ManualClock | None = None, **kwargs) -> AsyncThrottler:
     return AsyncThrottler(
         rate_limits=limits, retry_interval=POLL, clock=clock or ManualClock(), sleep=tick, **kwargs
     )
@@ -81,7 +79,7 @@ def test_hb_compat_modules_import_and_define_the_public_names():
     modules = [importlib.import_module(name) for name in MODULES]
     defined = {name for module in modules for name in vars(module)}
 
-    assert PUBLIC_NAMES <= defined
+    assert defined >= PUBLIC_NAMES
 
 
 def test_package_reexports_the_public_names():
@@ -167,7 +165,11 @@ async def test_full_limit_with_a_fitting_weight_blocks_instead_of_raising():
 def duplicate_link_limits() -> list[RateLimit]:
     return [
         rl("p", 4),
-        rl("ep", 1000, linked_limits=[LinkedLimitWeightPair("p", 1), LinkedLimitWeightPair("p", 1)]),
+        rl(
+            "ep",
+            1000,
+            linked_limits=[LinkedLimitWeightPair("p", 1), LinkedLimitWeightPair("p", 1)],
+        ),
     ]
 
 
@@ -197,7 +199,11 @@ def test_readd_with_fewer_duplicate_links_is_a_mismatch_that_warns_once(caplog):
 
 
 def test_readd_with_the_same_links_in_another_order_is_silent(caplog):
-    links = [LinkedLimitWeightPair("p", 1), LinkedLimitWeightPair("q", 2), LinkedLimitWeightPair("p", 1)]
+    links = [
+        LinkedLimitWeightPair("p", 1),
+        LinkedLimitWeightPair("q", 2),
+        LinkedLimitWeightPair("p", 1),
+    ]
     throttler = AsyncThrottler(rate_limits=[rl("ep", linked_limits=links)])
 
     with caplog.at_level(logging.WARNING):

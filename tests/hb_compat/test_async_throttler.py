@@ -52,10 +52,10 @@ def throttler(rate_limits: list[RateLimit]) -> AsyncThrottler:
 
 
 def test_init_without_rate_limits_share_pct(throttler):
-    assert 0.1 == throttler._retry_interval
-    assert 5 == len(throttler._rate_limits)
-    assert 1 == throttler._id_to_limit_map[TEST_POOL_ID].limit
-    assert 1 == throttler._id_to_limit_map[TEST_PATH_URL].limit
+    assert throttler._retry_interval == 0.1
+    assert len(throttler._rate_limits) == 5
+    assert throttler._id_to_limit_map[TEST_POOL_ID].limit == 1
+    assert throttler._id_to_limit_map[TEST_PATH_URL].limit == 1
 
 
 def test_init_with_rate_limits_share_pct(rate_limits):
@@ -67,23 +67,23 @@ def test_init_with_rate_limits_share_pct(rate_limits):
     expected_limit = math.floor(Decimal("10") * rate_share_pct / Decimal("100"))
 
     throttler = AsyncThrottler(rate_limits=rate_limits, limits_share_percentage=rate_share_pct)
-    assert 0.1 == throttler._retry_interval
-    assert 6 == len(throttler._rate_limits)
+    assert throttler._retry_interval == 0.1
+    assert len(throttler._rate_limits) == 6
     assert Decimal("1") == throttler._id_to_limit_map[TEST_POOL_ID].limit
     assert Decimal("1") == throttler._id_to_limit_map[TEST_PATH_URL].limit
     assert expected_limit == throttler._id_to_limit_map["ANOTHER_TEST"].limit
 
 
 def test_get_related_limits(throttler):
-    assert 5 == len(throttler._rate_limits)
+    assert len(throttler._rate_limits) == 5
 
     rate_limit, related_limits = throttler.get_related_limits(TEST_POOL_ID)
-    assert TEST_POOL_ID == rate_limit.limit_id
-    assert 0 == len(related_limits)
+    assert rate_limit.limit_id == TEST_POOL_ID
+    assert len(related_limits) == 0
 
     rate_limit, related_limits = throttler.get_related_limits(TEST_PATH_URL)
-    assert TEST_PATH_URL == rate_limit.limit_id
-    assert 1 == len(related_limits)
+    assert rate_limit.limit_id == TEST_PATH_URL
+    assert len(related_limits) == 1
 
 
 def test_has_limit_and_get_limit_return_stored_scaled_limit():
