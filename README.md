@@ -122,6 +122,32 @@ and `report_throttled(retry_after, status=)`), `assert_conforms_bound_unpausable
 `make(cap, clock, backoff_factory)` run the same scenarios; the bound unpausable suite skips the
 `pause_all` and multi-id ones and checks the bound `unpause_all()` instead.
 
+### Per-key cooldowns (KeyedCooldown)
+
+`KeyedCooldown(limit, time_interval)` keeps one sliding window per hashable key, with the same
+inclusive boundary as the limiter's windows. Interactive Brokers allows no identical request within
+15 seconds, and at most six requests per (contract, exchange, tickType) per 2 seconds:
+
+```python
+from rate_limit import KeyedCooldown
+
+identical = KeyedCooldown(1, 15.0)
+per_tick = KeyedCooldown(6, 2.0)
+
+async with limiter.execute_task("ib_messages"):  # the global limit first
+    await per_tick.acquire((con_id, exchange, tick_type))
+    await identical.acquire(request_key)  # cooldowns last, right before the send
+    await send(request)
+```
+
+It has the limiter's `acquire` / `try_acquire` / `blocked_for` shape with a key and an optional
+weight (`weight > limit` raises `RateLimitWeightError`), plus `reset(key)` / `reset()` and
+`len()` for the keys tracked. A key's window is created on its first charge (`blocked_for` never
+creates one) and dropped once empty, so memory stays bounded without sweeping every key.
+`KeyedCooldown` is independent of `RateLimiter` and not atomic with it: acquire the limiter first
+and the cooldowns immediately before sending, so each key's stamp is as close as possible to the
+real send.
+
 ---
 
 ## Status

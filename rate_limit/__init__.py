@@ -26,6 +26,7 @@ from rate_limit.helpers import (
     run_paced,
     run_paced_limit,
 )
+from rate_limit.keyed import KeyedCooldown
 from rate_limit.limiter import BoundLimiter, Charge, RateLimiter
 from rate_limit.pools import Pool, SlidingWindowPool, TokenBucketPool
 from rate_limit.protocols import (
@@ -59,6 +60,7 @@ __all__ = [
     "BoundLimiter",
     "Charge",
     "Clock",
+    "KeyedCooldown",
     "LinkedLimitWeightPair",
     "PausableRateLimiterProtocol",
     "PauseState",
