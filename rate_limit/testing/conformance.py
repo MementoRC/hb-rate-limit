@@ -26,9 +26,10 @@ from rate_limit.testing.clock import BlockingSleep, ManualClock
 from rate_limit.types import Clock, LinkedLimitWeightPair, RateLimit, Sleep
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable, Iterable, Sequence
 
     from rate_limit.backoff import RateLimitVerdict
+    from rate_limit.types import PoolKind, RateLimitLike
 
 _START = 1000.0
 _EPS = 1e-9
@@ -692,3 +693,101 @@ def _cap_spares_backoff_delays(
     verdict = limiter.report_throttled("a")
     _require(_close(verdict.delay, 30.0), f"a backoff-derived delay is never capped: {verdict}")
     _require(verdict.retry_after is None, f"no Retry-After was sent: {verdict}")
+
+
+# ---- kind change --------------------------------------------------------------------
+
+
+class KindChangeLimiter(Protocol):
+    """Opt-in surface for :func:`assert_conforms_kind_change` (``RateLimiter`` satisfies it)."""
+
+    async def acquire(self, limit_id: str) -> None: ...
+
+    def set_limits(self, limits: Iterable[RateLimitLike]) -> None: ...
+
+
+def assert_conforms_kind_change(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], KindChangeLimiter],
+) -> None:
+    """``set_limits`` keeps recorded usage across a change of ``RateLimit.kind``.
+
+    The factory must build a limiter with no safety margin. Window to bucket becomes a deficit
+    equal to the window's usage; bucket to window becomes one charge of ``ceil(used)`` stamped
+    at the switch. Retained ids of the same kind keep usage; a removed id starts fresh.
+    """
+    _run(_kind_window_to_bucket(make))
+    _run(_kind_bucket_to_window(make))
+    _run(_kind_same_kind_retains(make))
+    _run(_kind_removed_id_starts_fresh(make))
+
+
+_KIND_LIMIT = 4
+_KIND_INTERVAL = 2.0  # a bucket of 4 per 2.0s refills 2 tokens per second
+
+
+def _kind_limit(kind: PoolKind, limit_id: str = "a") -> RateLimit:
+    return RateLimit(limit_id, _KIND_LIMIT, _KIND_INTERVAL, kind=kind)
+
+
+async def _spend(limiter: KindChangeLimiter, count: int) -> None:
+    for _ in range(count):
+        await limiter.acquire("a")
+
+
+async def _kind_window_to_bucket(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], KindChangeLimiter],
+) -> None:
+    clock = ManualClock(_START)
+    limiter = make([_kind_limit("window")], clock, clock.sleep)
+    await _spend(limiter, _KIND_LIMIT)
+    limiter.set_limits([_kind_limit("token_bucket")])
+    await limiter.acquire("a")
+    _single_sleep(clock, 0.5, "a bucket seeded with the window's usage refills one token")
+
+    clock = ManualClock(_START)
+    limiter = make([_kind_limit("window")], clock, clock.sleep)
+    await _spend(limiter, 3)
+    limiter.set_limits([_kind_limit("token_bucket")])
+    await limiter.acquire("a")
+    _require(clock.sleeps == [], "the one token left after spending 3 of 4 must be free")
+    await limiter.acquire("a")
+    _single_sleep(clock, 0.5, "the call past the carried deficit")
+
+
+async def _kind_bucket_to_window(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], KindChangeLimiter],
+) -> None:
+    clock = ManualClock(_START)
+    limiter = make([_kind_limit("token_bucket")], clock, clock.sleep)
+    await _spend(limiter, 3)
+    clock.advance(0.25)  # used is now 2.5 tokens: the window is charged ceil(2.5) == 3
+    limiter.set_limits([_kind_limit("window")])
+    await limiter.acquire("a")
+    _require(clock.sleeps == [], "limit - ceil(used) == 1 call must still be free")
+    await limiter.acquire("a")
+    _single_sleep(clock, _KIND_INTERVAL, "the carried charge lasts a full window from the switch")
+
+
+async def _kind_same_kind_retains(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], KindChangeLimiter],
+) -> None:
+    cases: list[tuple[PoolKind, float]] = [("window", _KIND_INTERVAL), ("token_bucket", 0.5)]
+    for kind, expected in cases:
+        clock = ManualClock(_START)
+        limiter = make([_kind_limit(kind)], clock, clock.sleep)
+        await _spend(limiter, _KIND_LIMIT)
+        limiter.set_limits([_kind_limit(kind)])
+        await limiter.acquire("a")
+        _single_sleep(clock, expected, f"a retained {kind} id keeps its usage")
+
+
+async def _kind_removed_id_starts_fresh(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], KindChangeLimiter],
+) -> None:
+    clock = ManualClock(_START)
+    limiter = make([_kind_limit("window")], clock, clock.sleep)
+    await _spend(limiter, _KIND_LIMIT)
+    limiter.set_limits([_kind_limit("window", "other")])
+    limiter.set_limits([_kind_limit("window"), _kind_limit("window", "other")])
+    await _spend(limiter, _KIND_LIMIT)
+    _require(clock.sleeps == [], "an id removed then re-added must start with a fresh pool")
