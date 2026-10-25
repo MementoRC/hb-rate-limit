@@ -268,7 +268,15 @@ class TestBucketRefund:
         assert pool.refund(4, 0.0, 0.0) == 4.0
         assert pool.used == 0
 
-    def test_clamps_at_capacity(self) -> None:
+    def test_credits_only_the_unrefilled_part(self) -> None:
+        pool = TokenBucketPool(10, 1)
+        pool.evict(0.0)
+        pool.reserve(4, 0.0)
+        pool.reserve(4, 2.0)  # deficit 6: 2 of the first charge refilled meanwhile
+        assert pool.refund(4, 0.0, 2.0) == pytest.approx(2.0)
+        assert pool.used == pytest.approx(4.0)
+
+    def test_never_rises_above_capacity(self) -> None:
         pool = TokenBucketPool(10, 1)
         pool.evict(0.0)
         pool.reserve(4, 0.0)
@@ -278,13 +286,14 @@ class TestBucketRefund:
         assert pool.used == 0
         assert pool.wait_for(10, 3.0) == 0.0
 
-    def test_is_approximate_and_ignores_the_stamp(self) -> None:
+    def test_charge_lost_to_clamping_credits_nothing(self) -> None:
         pool = TokenBucketPool(10, 1)
         pool.evict(0.0)
-        pool.reserve(4, 0.0)
-        pool.reserve(4, 2.0)  # deficit 6: 2 of the first charge refilled meanwhile
-        assert pool.refund(4, 123.0, 2.0) == 4.0  # min(cost, used), not the unrefilled 2
-        assert pool.used == pytest.approx(2.0)
+        pool.reserve(5, 0.0)
+        pool.evict(5.0)  # refilled to capacity: the first charge is gone
+        pool.reserve(8, 5.0)
+        assert pool.refund(5, 0.0, 5.0) == 0.0
+        assert pool.used == 8
 
 
 class TestNewPool:

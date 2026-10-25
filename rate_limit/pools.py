@@ -212,14 +212,16 @@ class TokenBucketPool:
         return 0.0
 
     def refund(self, cost: int, stamp: float, now: float) -> float:
-        """Refill to ``now``, then return ``min(cost, used)`` tokens, never above ``capacity``.
+        """Refill to ``now``, then return ``min(used, cost - refill * (now - stamp))`` (>= 0).
 
-        A bucket does not track individual charges (``stamp`` is unused), so this is the best
-        available approximation: the part of the charge that has already refilled cannot be
-        told apart from other usage, so it may be handed back again (up to the current deficit).
+        A bucket keeps no per-charge record, so this bounds the charge's remaining effect: the gap
+        between the never-charged and the actual bucket starts at ``cost`` and only shrinks, at
+        most at the refill rate, while the never-charged one sits at capacity. So it never
+        over-credits, and it is exact when no clamping happened in between.
         """
         self.evict(now)
-        returned = min(float(cost), self.used)
+        unrefilled = max(0.0, cost - self._refill * max(0.0, now - stamp))
+        returned = min(self.used, unrefilled)
         self._tokens = min(self._capacity, self._tokens + returned)
         return returned
 

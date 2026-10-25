@@ -82,9 +82,10 @@ limiter.unpause("feed")  # or limiter.unpause_all()
 `reserve()` waits exactly like `acquire()` but returns a `Charge` receipt. If the request never
 went out (signing failed, say), `charge.refund()` hands the capacity back on every pool it
 charged. A refund is idempotent and thread-safe; it is skipped for a limit id that has since been
-removed or changed kind, and a window charge that has already expired gives nothing back. A
-token bucket does not track individual charges, so it returns `min(cost, used)`. Waiters are not
-woken early: they pick up the capacity when they next re-assess.
+removed (even if re-added) or changed kind, and an expired charge gives nothing back. A token
+bucket does not track individual charges, so it returns only the part that cannot have refilled
+yet, `min(used, cost - refill * elapsed)`, which never over-credits. Waiters are not woken early:
+they pick up the capacity when they next re-assess.
 
 ```python
 charge = await limiter.reserve("klines")

@@ -1036,6 +1036,27 @@ class TestRefund:
         assert charge.refunded
         assert rl._pools["a"].used == pytest.approx(1.0)
 
+    async def test_kind_round_trip_at_the_same_time_is_a_noop(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 2, 10))
+        charge = await rl.reserve("a")
+        rl.set_limits([bucket("a", 2, 10)])
+        rl.set_limits([RateLimit("a", 2, 10)])  # carry-over entry equals (stamp, cost)
+        charge.refund()
+        assert rl._pools["a"].used == 1
+
+    @pytest.mark.parametrize("limit", [RateLimit("a", 2, 10), bucket("a", 2, 10)])
+    async def test_readded_id_keeps_its_new_charge(
+        self, clock: ManualClock, limit: RateLimit
+    ) -> None:
+        rl = make(clock, limit)
+        stale = await rl.reserve("a")
+        rl.set_limits([])
+        rl.set_limits([limit])
+        fresh = await rl.reserve("a")
+        assert (fresh.stamp, dict(fresh.costs)) == (stale.stamp, dict(stale.costs))
+        stale.refund()
+        assert rl._pools["a"].used == 1
+
     async def test_removed_limit_is_skipped(self, clock: ManualClock) -> None:
         rl = make(
             clock,

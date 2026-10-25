@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import logging
 import math
 import threading
@@ -95,6 +96,10 @@ class RateLimiter:
         self._scaled: dict[str, RateLimit] = {}
         self._owners: dict[str, str | None] = {}
         self._pools: dict[str, Pool] = {}
+        # pool generation per id: new on install, removal or kind change, kept by a same-kind
+        # rebuild; drawn from one counter so a removed then re-added id never reuses one
+        self._generations: dict[str, int] = {}
+        self._next_generation = itertools.count()
         self._states: dict[str, PauseState] = {}
         self._pause_all_until = 0.0
         # (loop, event) of every acquirer sleeping out a pause; ``unpause*`` sets them
@@ -154,7 +159,9 @@ class RateLimiter:
         with self._lock:
             now = self._clock()
             old_scaled, old_pools, old_owners = self._scaled, self._pools, self._owners
+            old_generations = self._generations
             self._raw, self._scaled, self._pools, self._owners = {}, {}, {}, {}
+            self._generations = {}
             for limit_id, raw in incoming.items():
                 self._install(raw, None)
                 scaled = self._scaled[limit_id]
@@ -168,6 +175,8 @@ class RateLimiter:
                         self._margin,
                         now,
                     )
+                    if old_scaled[limit_id].kind == scaled.kind:  # same-kind rebuild: same charges
+                        self._generations[limit_id] = old_generations[limit_id]
                 if old_scaled.get(limit_id) == scaled:
                     self._owners[limit_id] = old_owners.get(limit_id)
 
@@ -179,6 +188,7 @@ class RateLimiter:
         self._pools[raw.limit_id] = new_pool(
             scaled.kind, scaled.limit, scaled.time_interval, self._margin
         )
+        self._generations[raw.limit_id] = next(self._next_generation)
 
     def has_limit(self, limit_id: str) -> bool:
         with self._lock:
@@ -320,8 +330,8 @@ class RateLimiter:
 
     def _receipt(self, limit_id: str, plan: list[tuple[str, int]], now: float) -> Charge:
         """The receipt for ``plan`` just recorded at ``now`` (lock held)."""
-        kinds = {charge_id: type(self._pools[charge_id]) for charge_id, _ in plan}
-        return Charge(self, limit_id, dict(plan), kinds, now)
+        generations = {charge_id: self._generations[charge_id] for charge_id, _ in plan}
+        return Charge(self, limit_id, dict(plan), generations, now)
 
     # ---- acquire --------------------------------------------------------------------
 
@@ -577,13 +587,13 @@ class Charge:
         limiter: RateLimiter,
         limit_id: str,
         costs: Mapping[str, int],
-        kinds: Mapping[str, type[Pool]],
+        generations: Mapping[str, int],
         stamp: float,
     ) -> None:
         self._limiter = limiter
         self._limit_id = limit_id
         self._costs = MappingProxyType(dict(costs))
-        self._kinds = dict(kinds)  # pool class charged, so a kind change skips the refund
+        self._generations = dict(generations)  # pool generation charged, per pool id
         self._stamp = stamp
         self._refunded = False
 
@@ -608,10 +618,12 @@ class Charge:
     def refund(self) -> None:
         """Return the charge to every pool it touched; idempotent and thread-safe.
 
-        A pool is skipped when its limit id has since been removed, or ``set_limits`` changed
-        its kind. A window gives the charge back only while it still counts; a bucket returns
-        ``min(cost, used)`` (see :meth:`TokenBucketPool.refund`). Waiters are not woken early:
-        they pick up the returned capacity when they next re-assess.
+        A pool is skipped unless it is still the generation charged: removing its limit id
+        (even if re-added later) or changing its kind via ``set_limits`` starts a new one, a
+        same-kind rebuild does not. A window gives the charge back only while it still counts;
+        a bucket returns only the part that cannot have refilled yet (see
+        :meth:`TokenBucketPool.refund`). Waiters are not woken early: they pick up the returned
+        capacity when they next re-assess.
         """
         limiter = self._limiter
         with limiter._lock:
@@ -620,9 +632,8 @@ class Charge:
             self._refunded = True
             now = limiter._clock()
             for pool_id, cost in self._costs.items():
-                pool = limiter._pools.get(pool_id)
-                if pool is not None and type(pool) is self._kinds[pool_id]:
-                    pool.refund(cost, self._stamp, now)
+                if limiter._generations.get(pool_id) == self._generations[pool_id]:
+                    limiter._pools[pool_id].refund(cost, self._stamp, now)
 
 
 class _TaskContext:

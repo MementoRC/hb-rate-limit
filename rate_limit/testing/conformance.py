@@ -940,7 +940,8 @@ def assert_conforms_refundable(
     The factory must build a limiter with no safety margin; ``try_acquire`` returns 0.0 and
     records when a call fits, else the wait. A refund frees capacity without the clock
     advancing (window and token bucket), is idempotent, frees only its own charge, gives nothing
-    back once a window charge has expired, and reaches every linked pool.
+    back once the charge has expired (a window aged out, a bucket refilled ``cost`` since), and
+    reaches every linked pool.
     """
     _run(_refund_restores_capacity(make))
     _run(_refund_is_idempotent(make))
@@ -1007,14 +1008,15 @@ async def _refund_leaves_other_charges(
 async def _refund_after_expiry_is_a_noop(
     make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
 ) -> None:
-    clock = ManualClock(_START)
-    limiter = make([_refund_limit()], clock, clock.sleep)
-    stale = await limiter.reserve("a")
-    clock.advance(_REFUND_INTERVAL * 1.001)
-    await limiter.reserve("a")
-    await limiter.reserve("a")
-    stale.refund()
-    _full(limiter, "refunding an expired charge must not add headroom")
+    for kind in _REFUND_KINDS:  # older than the window, and than cost / refill for a bucket
+        clock = ManualClock(_START)
+        limiter = make([_refund_limit(kind)], clock, clock.sleep)
+        stale = await limiter.reserve("a")
+        clock.advance(_REFUND_INTERVAL * 1.001)
+        await limiter.reserve("a")
+        await limiter.reserve("a")
+        stale.refund()
+        _full(limiter, f"refunding an expired {kind} charge must not add headroom")
 
 
 async def _refund_covers_linked_pools(
