@@ -35,3 +35,20 @@ class ManualClock:
             self.on_sleep(seconds)
         await asyncio.sleep(0)  # yield so concurrent waiters interleave
         self.now = max(self.now, start + seconds)  # concurrent sleepers overlap, not sum
+
+
+class BlockingSleep:
+    """A sleep that only ends when cancelled, so tests control when a sleeper may wake.
+
+    :ivar started: set once the first sleep begins
+    :ivar durations: every ``sleep`` duration requested, in order
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.durations: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.durations.append(seconds)
+        self.started.set()
+        await asyncio.Event().wait()

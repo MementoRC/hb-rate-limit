@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -14,13 +14,20 @@ from rate_limit import (
     ThrottlerProtocol,
 )
 from rate_limit.testing import (
+    KindChangeLimiter,
     ManualClock,
+    RetryAfterCapLimiter,
+    UnpausableLimiter,
     assert_conforms_backoff,
+    assert_conforms_kind_change,
     assert_conforms_pausable,
     assert_conforms_rest_limiter,
+    assert_conforms_retry_after_cap,
     assert_conforms_throttler,
+    assert_conforms_token_bucket,
+    assert_conforms_unpausable,
 )
-from rate_limit.types import Clock, Sleep
+from rate_limit.types import Clock, RateLimitLike, Sleep
 
 
 def make_rest(limit: int, interval: float):  # noqa: ANN201
@@ -56,6 +63,74 @@ def test_throttler_conformance_basic_only() -> None:
 
 def test_backoff_conformance_with_custom_policy() -> None:
     assert_conforms_backoff(lambda: BackoffPolicy(1.0, 8.0, 30.0))
+
+
+def test_token_bucket_conformance() -> None:
+    assert_conforms_token_bucket(make_throttler)
+
+
+def test_unpausable_conformance() -> None:
+    def make(limits: Sequence[RateLimit], clock: Clock, sleep: Sleep) -> UnpausableLimiter:
+        return RateLimiter(limits, clock=clock, sleep=sleep)
+
+    assert_conforms_unpausable(make)
+
+
+def test_retry_after_cap_conformance() -> None:
+    def make(
+        cap: float, clock: Clock, backoff_factory: Callable[[], BackoffPolicy]
+    ) -> RetryAfterCapLimiter:
+        return RateLimiter(
+            clock=clock, backoff_factory=backoff_factory, max_retry_after_seconds=cap
+        )
+
+    assert_conforms_retry_after_cap(make)
+
+
+def test_kind_change_conformance() -> None:
+    def make(limits: Sequence[RateLimit], clock: Clock, sleep: Sleep) -> KindChangeLimiter:
+        return RateLimiter(limits, clock=clock, sleep=sleep)
+
+    assert_conforms_kind_change(make)
+
+
+def test_conformance_detects_a_limiter_that_drops_usage_on_set_limits() -> None:
+    class Forgetful(RateLimiter):
+        def set_limits(self, limits: Iterable[RateLimitLike]) -> None:
+            incoming = list(limits)
+            super().set_limits([])
+            super().set_limits(incoming)
+
+    with pytest.raises(AssertionError):
+        assert_conforms_kind_change(lambda limits, c, s: Forgetful(limits, clock=c, sleep=s))
+
+
+def test_conformance_detects_a_window_posing_as_a_bucket() -> None:
+    def make(limits: Sequence[RateLimit], clock: Clock, sleep: Sleep) -> ThrottlerProtocol:
+        windowed = [RateLimit(r.limit_id, r.limit, r.time_interval) for r in limits]
+        return RateLimiter(windowed, clock=clock, sleep=sleep)
+
+    with pytest.raises(AssertionError):
+        assert_conforms_token_bucket(make)
+
+
+def test_conformance_detects_a_limiter_that_ignores_unpause() -> None:
+    class Deaf(RateLimiter):
+        def unpause(self, limit_id: str) -> None:
+            return None
+
+    with pytest.raises(AssertionError):
+        assert_conforms_unpausable(lambda limits, c, s: Deaf(limits, clock=c, sleep=s))
+
+
+def test_conformance_detects_an_uncapped_limiter() -> None:
+    def make(
+        cap: float, clock: Clock, backoff_factory: Callable[[], BackoffPolicy]
+    ) -> RetryAfterCapLimiter:
+        return RateLimiter(clock=clock, backoff_factory=backoff_factory)
+
+    with pytest.raises(AssertionError):
+        assert_conforms_retry_after_cap(make)
 
 
 def test_conformance_detects_a_broken_limiter() -> None:
@@ -123,6 +198,10 @@ def test_plugin_fixtures(manual_clock: ManualClock, conformance_suites: SimpleNa
     assert conformance_suites.rest_limiter is assert_conforms_rest_limiter
     assert conformance_suites.pausable is assert_conforms_pausable
     assert conformance_suites.throttler is assert_conforms_throttler
+    assert conformance_suites.token_bucket is assert_conforms_token_bucket
+    assert conformance_suites.unpausable is assert_conforms_unpausable
+    assert conformance_suites.retry_after_cap is assert_conforms_retry_after_cap
+    assert conformance_suites.kind_change is assert_conforms_kind_change
 
 
 def test_manual_clock() -> None:
