@@ -11,7 +11,7 @@ import asyncio
 import contextlib
 import inspect
 import math
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from rate_limit.backoff import BackoffPolicy
 from rate_limit.errors import RateLimitPoolConflictError, RateLimitWeightError
@@ -22,11 +22,13 @@ from rate_limit.protocols import (
     ThrottlerProtocol,
     WeightedThrottlerProtocol,
 )
-from rate_limit.testing.clock import ManualClock
+from rate_limit.testing.clock import BlockingSleep, ManualClock
 from rate_limit.types import Clock, LinkedLimitWeightPair, RateLimit, Sleep
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
+
+    from rate_limit.backoff import RateLimitVerdict
 
 _START = 1000.0
 _EPS = 1e-9
@@ -418,3 +420,275 @@ def assert_conforms_backoff(policy_factory: Callable[[], BackoffPolicy]) -> None
     _require(
         all(fixed.next_delay(s, None) == 63.0 for s in (429, 429, 418)), "fixed(s) is constant"
     )
+
+
+# ---- opt-in suites (v0.2 features; not part of the required protocols) --------------
+# Run these only if your limiter claims the feature.
+
+
+# ---- token bucket -------------------------------------------------------------------
+
+
+def assert_conforms_token_bucket(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], ThrottlerProtocol],
+) -> None:
+    """``RateLimit(kind="token_bucket")``: full burst, then ``cost / refill`` per deficit.
+
+    The factory receives limits whose ``kind`` is ``"token_bucket"`` and must build a limiter
+    with no safety margin (refill is exactly ``limit / time_interval``).
+    """
+    _run(_bucket_burst_and_deficit(make))
+    _run(_bucket_fractional_refill(make))
+    _run(_bucket_capacity_cap(make))
+
+
+_BUCKET_CAPACITY = 4
+_BUCKET_REFILL = 2.0  # tokens per second: 4 per 2.0s
+
+
+def _bucket(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], ThrottlerProtocol],
+) -> tuple[ManualClock, ThrottlerProtocol]:
+    clock = ManualClock(_START)
+    limit = RateLimit("a", _BUCKET_CAPACITY, _BUCKET_CAPACITY / _BUCKET_REFILL, kind="token_bucket")
+    return clock, make([limit], clock, clock.sleep)
+
+
+async def _drain(throttler: ThrottlerProtocol, count: int = _BUCKET_CAPACITY) -> None:
+    for _ in range(count):
+        await _enter(throttler, "a")
+
+
+def _single_sleep(clock: ManualClock, expected: float, what: str) -> None:
+    _require(len(clock.sleeps) == 1, f"{what}: expected one sleep, got {clock.sleeps}")
+    _require(_close(clock.sleeps[0], expected), f"{what}: must wait {expected}: {clock.sleeps}")
+
+
+async def _bucket_burst_and_deficit(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], ThrottlerProtocol],
+) -> None:
+    clock, throttler = _bucket(make)
+    await _drain(throttler)
+    _require(clock.sleeps == [], "a full bucket admits a burst of `limit` without waiting")
+    await _enter(throttler, "a")
+    _single_sleep(clock, 1 / _BUCKET_REFILL, "the call after the burst")
+
+    clock, throttler = _bucket(make)
+    await _drain(throttler)
+    await _enter(throttler, "a", weights={"a": 3})
+    _single_sleep(clock, 3 / _BUCKET_REFILL, "a weight-3 call on an empty bucket")
+
+
+async def _bucket_fractional_refill(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], ThrottlerProtocol],
+) -> None:
+    clock, throttler = _bucket(make)
+    await _drain(throttler)
+    clock.advance(0.25)  # half a token back: the deficit is the other half
+    await _enter(throttler, "a")
+    _single_sleep(clock, 0.25, "a half-refilled bucket")
+
+
+async def _bucket_capacity_cap(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], ThrottlerProtocol],
+) -> None:
+    clock, throttler = _bucket(make)
+    await _enter(throttler, "a")
+    clock.advance(1000.0)
+    await _drain(throttler)
+    _require(clock.sleeps == [], "an idle bucket refills to capacity")
+    await _enter(throttler, "a")
+    _single_sleep(clock, 1 / _BUCKET_REFILL, "idle time must not bank more than capacity")
+
+
+# ---- unpause ------------------------------------------------------------------------
+
+
+class UnpausableLimiter(Protocol):
+    """Opt-in surface for :func:`assert_conforms_unpausable` (``RateLimiter`` satisfies it)."""
+
+    async def acquire(self, limit_id: str) -> None: ...
+
+    def pause(self, limit_id: str, seconds: float) -> None: ...
+
+    def pause_all(self, seconds: float) -> None: ...
+
+    def unpause(self, limit_id: str) -> None: ...
+
+    def unpause_all(self) -> None: ...
+
+    def is_paused(self, limit_id: str) -> bool: ...
+
+
+def assert_conforms_unpausable(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], UnpausableLimiter],
+) -> None:
+    """``unpause`` / ``unpause_all``: sleeping acquirers wake without the clock advancing.
+
+    The factory's ``sleep`` is a :class:`BlockingSleep`, so a woken acquirer is the only way
+    out of a pause. The limiter must wake acquirers that are sleeping out a pause.
+    """
+    _run(_unpause_wakes_sleeper(make))
+    _run(_unpause_keeps_pause_all(make))
+    _run(_unpause_all_lifts_everything(make))
+    _run(_unpause_keeps_spent_capacity(make))
+
+
+async def _yield_until(condition: Callable[[], bool], what: str) -> None:
+    for _ in range(200):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+async def _finishes(task: asyncio.Task[None], what: str) -> None:
+    try:
+        await asyncio.wait_for(task, timeout=1.0)
+    except TimeoutError:
+        raise AssertionError(f"{what}: the acquirer must wake and finish") from None
+
+
+async def _abandon(task: asyncio.Task[None]) -> None:
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def _unpause_wakes_sleeper(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], UnpausableLimiter],
+) -> None:
+    clock, sleeper = ManualClock(_START), BlockingSleep()
+    limiter = make([RateLimit("a", 5, 1.0)], clock, sleeper)
+    limiter.pause("a", 7200.0)
+    task = asyncio.create_task(limiter.acquire("a"))
+    try:
+        await asyncio.wait_for(sleeper.started.wait(), timeout=1.0)
+        _require(not task.done(), "an acquirer must wait out a pause")
+        limiter.unpause("a")
+        await _finishes(task, "unpause")
+    finally:
+        await _abandon(task)
+    _require(clock() == _START, "unpause must not need the clock to advance")
+    _require(_close(sleeper.durations[0], 7200.0), f"slept the pause: {sleeper.durations}")
+    _require(not limiter.is_paused("a"), "unpause must lift the pause")
+
+
+async def _unpause_keeps_pause_all(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], UnpausableLimiter],
+) -> None:
+    clock, sleeper = ManualClock(_START), BlockingSleep()
+    limiter = make([RateLimit("a", 5, 1.0)], clock, sleeper)
+    limiter.pause("a", 7200.0)
+    limiter.pause_all(100.0)
+    task = asyncio.create_task(limiter.acquire("a"))
+    try:
+        await asyncio.wait_for(sleeper.started.wait(), timeout=1.0)
+        limiter.unpause("a")
+        await _yield_until(lambda: len(sleeper.durations) >= 2, "a second sleep")
+        _require(not task.done(), "unpause(id) must leave pause_all in force")
+        _require(limiter.is_paused("a"), "pause_all must still block the id")
+        _require(_close(sleeper.durations[1], 100.0), f"got {sleeper.durations}")
+        limiter.unpause_all()
+        await _finishes(task, "unpause_all")
+    finally:
+        await _abandon(task)
+
+
+async def _unpause_all_lifts_everything(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], UnpausableLimiter],
+) -> None:
+    clock, sleeper = ManualClock(_START), BlockingSleep()
+    limiter = make([RateLimit("a", 5, 1.0), RateLimit("b", 5, 1.0)], clock, sleeper)
+    limiter.pause_all(7200.0)
+    limiter.pause("b", 9000.0)
+    task = asyncio.create_task(limiter.acquire("b"))
+    try:
+        await asyncio.wait_for(sleeper.started.wait(), timeout=1.0)
+        limiter.unpause_all()
+        await _finishes(task, "unpause_all")
+    finally:
+        await _abandon(task)
+    _require(not limiter.is_paused("a") and not limiter.is_paused("b"), "both pauses lifted")
+    _require(clock() == _START, "unpause_all must not need the clock to advance")
+
+
+async def _unpause_keeps_spent_capacity(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], UnpausableLimiter],
+) -> None:
+    clock, sleeper = ManualClock(_START), BlockingSleep()
+    limiter = make([RateLimit("a", 1, 10.0)], clock, sleeper)
+    await limiter.acquire("a")  # spends the only slot
+    limiter.pause("a", 7200.0)
+    task = asyncio.create_task(limiter.acquire("a"))
+    try:
+        await asyncio.wait_for(sleeper.started.wait(), timeout=1.0)
+        limiter.unpause("a")
+        await _yield_until(lambda: len(sleeper.durations) >= 2, "the window sleep")
+        _require(not task.done(), "unpause must not refund capacity already spent")
+        _require(_close(sleeper.durations[1], 10.0), f"must wait the window: {sleeper.durations}")
+    finally:
+        await _abandon(task)
+
+
+# ---- Retry-After cap ----------------------------------------------------------------
+
+
+class RetryAfterCapLimiter(Protocol):
+    """Opt-in surface for :func:`assert_conforms_retry_after_cap` (``RateLimiter`` satisfies it)."""
+
+    def report_throttled(
+        self, limit_id: str, retry_after: float | None = None, *, status: int | None = None
+    ) -> RateLimitVerdict: ...
+
+    def paused_until(self, limit_id: str) -> float: ...
+
+
+def assert_conforms_retry_after_cap(
+    make: Callable[[float, Clock, Callable[[], BackoffPolicy]], RetryAfterCapLimiter],
+) -> None:
+    """``max_retry_after_seconds``: a server ``Retry-After`` is clamped, derived delays are not.
+
+    ``make(cap, clock, backoff_factory)`` builds a limiter whose cap is ``cap`` seconds.
+    """
+    _cap_clamps(make)
+    _cap_honours_lower_values(make)
+    _cap_spares_backoff_delays(make)
+
+
+_CAP = 60.0
+
+
+def _cap_clamps(
+    make: Callable[[float, Clock, Callable[[], BackoffPolicy]], RetryAfterCapLimiter],
+) -> None:
+    clock = ManualClock(_START)
+    limiter = make(_CAP, clock, BackoffPolicy)
+    verdict = limiter.report_throttled("a", 7200.0)
+    _require(_close(verdict.delay, _CAP), f"a Retry-After above the cap pauses the cap: {verdict}")
+    _require(
+        verdict.retry_after is not None and _close(verdict.retry_after, _CAP),
+        f"the verdict must report the capped Retry-After: {verdict}",
+    )
+    _require(_close(limiter.paused_until("a") - clock(), _CAP), "the pause itself is the cap")
+
+
+def _cap_honours_lower_values(
+    make: Callable[[float, Clock, Callable[[], BackoffPolicy]], RetryAfterCapLimiter],
+) -> None:
+    for retry_after in (_CAP / 2, _CAP):
+        clock = ManualClock(_START)
+        limiter = make(_CAP, clock, BackoffPolicy)
+        verdict = limiter.report_throttled("a", retry_after)
+        _require(_close(verdict.delay, retry_after), f"{retry_after} is within the cap: {verdict}")
+        _require(verdict.retry_after == retry_after, f"retry_after must be as sent: {verdict}")
+
+
+def _cap_spares_backoff_delays(
+    make: Callable[[float, Clock, Callable[[], BackoffPolicy]], RetryAfterCapLimiter],
+) -> None:
+    clock = ManualClock(_START)
+    limiter = make(1.0, clock, lambda: BackoffPolicy.fixed(30.0))
+    verdict = limiter.report_throttled("a")
+    _require(_close(verdict.delay, 30.0), f"a backoff-derived delay is never capped: {verdict}")
+    _require(verdict.retry_after is None, f"no Retry-After was sent: {verdict}")

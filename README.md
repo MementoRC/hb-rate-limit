@@ -81,7 +81,12 @@ Share one budget across instances with `get_pool_limiter(pool_key, limit)`; the 
 `safety_margin_pct` (default 0.0; hb_compat shims pass 0.05) are part of the pool's identity.
 The `run_paced` / `note_rate_limited` helpers take an optional `clock=` for limiters that can
 pause but cannot report `is_paused()`. Tests use `rate_limit.testing.ManualClock` and the
-`assert_conforms_*` suites.
+`assert_conforms_*` suites. Three opt-in suites cover the v0.2 features that are not part of the
+required protocols; run one only if your limiter claims the feature (each is also a
+`conformance_suites` fixture attribute): `assert_conforms_token_bucket(make)` with
+`make(limits, clock, sleep)`, `assert_conforms_unpausable(make)` with `make(limits, clock, sleep)`
+(driven by `rate_limit.testing.BlockingSleep`), and `assert_conforms_retry_after_cap(make)` with
+`make(cap, clock, backoff_factory)`.
 
 ---
 
@@ -91,6 +96,9 @@ v0.2.0: adds `TokenBucketPool` (per-limit `kind="token_bucket"`), `unpause` / `u
 opt-in `max_retry_after_seconds` cap, `safety_margin_pct` on `get_pool_limiter`, and an optional
 `clock` for the pacing helpers. v0.1.0 shipped sliding-window pools, the registry, pause/backoff,
 helpers and the conformance kit.
+
+Unreleased: the conformance kit gains opt-in `token_bucket`, `unpausable` and `retry_after_cap`
+suites (plus `BlockingSleep`), closing the v0.2 kit gap.
 
 ---
 

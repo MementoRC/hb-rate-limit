@@ -27,7 +27,7 @@ from rate_limit import (
     UnknownRateLimitError,
     WeightedThrottlerProtocol,
 )
-from rate_limit.testing import ManualClock
+from rate_limit.testing import BlockingSleep, ManualClock
 
 
 def make(clock: ManualClock, *limits: RateLimit, **kw: object) -> RateLimiter:
@@ -632,19 +632,6 @@ class TestPause:
         started = asyncio.get_running_loop().time()
         await asyncio.to_thread(lambda: asyncio.run(rl.acquire("a")))
         assert asyncio.get_running_loop().time() - started >= 0.12
-
-
-class BlockingSleep:
-    """A sleep that only ends when cancelled, so tests control when a sleeper may wake."""
-
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-        self.durations: list[float] = []
-
-    async def __call__(self, seconds: float) -> None:
-        self.durations.append(seconds)
-        self.started.set()
-        await asyncio.Event().wait()
 
 
 class TestRetryAfterCap:
