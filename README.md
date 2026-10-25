@@ -152,16 +152,19 @@ real send.
 
 ## Status
 
+v0.3.0: ships `py.typed`; refund receipts, where `RateLimiter.reserve()` / `BoundLimiter.reserve()`
+return a `Charge` with `refund()`, plus `execute_task(..., refund_on_error=True)` and an opt-in
+`refundable` conformance suite; `KeyedCooldown` for per-key windows; `BoundLimiter.paused_until()`
+and `report_throttled()`, with the bound-limiter conformance suites `bound_unpausable` and
+`bound_retry_after_cap`. The kit also gains the opt-in `token_bucket`, `unpausable`,
+`retry_after_cap` and `kind_change` suites (plus `BlockingSleep`), closing the v0.2 kit gap.
+`acquire()` is unchanged and everything is additive, except that the `Pool` protocol gains
+`refund()`: custom `Pool` implementations must add it.
+
 v0.2.0: adds `TokenBucketPool` (per-limit `kind="token_bucket"`), `unpause` / `unpause_all`, an
 opt-in `max_retry_after_seconds` cap, `safety_margin_pct` on `get_pool_limiter`, and an optional
 `clock` for the pacing helpers. v0.1.0 shipped sliding-window pools, the registry, pause/backoff,
 helpers and the conformance kit.
-
-Unreleased: the conformance kit gains opt-in `token_bucket`, `unpausable`, `retry_after_cap` and
-`kind_change` suites (plus `BlockingSleep`), closing the v0.2 kit gap, and bound-limiter
-variants `bound_unpausable` and `bound_retry_after_cap`; `BoundLimiter` gains `paused_until()` and
-`report_throttled()`. Refund receipts: `reserve()` returns a `Charge` with `refund()`,
-`execute_task(..., refund_on_error=True)`, and an opt-in `refundable` suite.
 
 ---
 
