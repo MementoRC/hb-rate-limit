@@ -458,6 +458,16 @@ class TestLinkedAndWeights:
         assert rl.try_acquire("a") == 0.0
         assert rl.try_acquire("a") > 0
 
+    async def test_weight_for_unregistered_linked_limit_is_ignored(
+        self, clock: ManualClock
+    ) -> None:
+        a = RateLimit("a", 2, 10, linked_limits=[LinkedLimitWeightPair("ghost")])
+        rl = make(clock, a, unknown="allow")
+        await rl.acquire("a", {"ghost": 99})  # declared, but not charged: no weight error
+        await rl.acquire("a")
+        assert clock.sleeps == []
+        assert rl.try_acquire("a") > 0  # only the primary's own weight was charged, twice
+
 
 class TestUnknown:
     async def test_raise_mode(self, clock: ManualClock) -> None:
@@ -738,6 +748,14 @@ class TestUnpause:
         assert not task.done()
         rl.unpause_all()
         await asyncio.wait_for(task, 1)
+
+    async def test_pause_ending_before_the_sleep_skips_it(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 5, 1))
+        rl.pause("a", 5)
+        clock.advance(6)  # the pause ran out between the check and the sleep
+        await rl._sleep_unless_unpaused("a", 5.0)
+        assert clock.sleeps == []
+        assert not rl._wakers
 
     async def test_unpause_does_not_free_pool_capacity(self, clock: ManualClock) -> None:
         rl = make(clock, RateLimit("a", 1, 10))

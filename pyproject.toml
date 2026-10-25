@@ -52,7 +52,9 @@ quality-ci = { features = ["ci", "dev"], solve-group = "default" }
 py312 = { features = ["py312", "dev"], solve-group = "py312" }
 
 [tool.pixi.tasks]
-test = "pytest tests/"
+# CI's reusable workflow runs `pixi run test`; it enforces [tool.coverage.report] fail_under.
+test = "pytest tests/ --cov=rate_limit --cov-report=term-missing"
+test-quick = "pytest tests/"
 test-unit = "pytest tests/unit/"
 test-integration = "pytest tests/integration/"
 lint = "ruff check rate_limit tests"
@@ -101,10 +103,12 @@ source_pkgs = ["rate_limit"]
 omit = ["rate_limit/__about__.py"]
 
 [tool.coverage.report]
-fail_under = 90
+fail_under = 100
 show_missing = true
 skip_covered = true
 exclude_lines = ["no cov", "if __name__", "if TYPE_CHECKING", "raise NotImplementedError", "@overload"]
+# Protocol stubs: a body that is only `...` is a signature, not logic.
+exclude_also = ['^\s*\.\.\.\s*$', ':\s*\.\.\.\s*$']
 
 [tool.hummingbot.supersedes]
 modules = []

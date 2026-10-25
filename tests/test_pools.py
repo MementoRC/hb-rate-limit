@@ -105,6 +105,32 @@ class TestRefill:
         assert 1e9 + wait > 1e9
 
 
+class TestRoundingNudges:
+    def test_bucket_wait_never_undershoots_when_now_is_behind_the_reference(self) -> None:
+        # now < last: the wait is measured from last, and ``now + (target - now)`` rounds
+        # below ``target`` for these values, so wait_for must nudge it up.
+        pool = TokenBucketPool(7, 0.3)
+        pool.evict(6.2)
+        pool.reserve(7, 6.2)
+        now = 6.052299
+        wait = pool.wait_for(7, now)
+        assert wait > 0
+        assert now + wait >= 6.2 + 7 / 0.3 - 1e-9
+        pool.evict(now + wait)
+        assert pool.wait_for(7, now + wait) == 0.0
+
+    def test_window_wait_never_undershoots_the_expiry(self) -> None:
+        # ``now + (expiry - now)`` rounds below ``expiry`` for these values.
+        pool = SlidingWindowPool(1, 7.7)
+        pool.reserve(1, 0.1)
+        now = 2.869955874870197
+        expiry = 0.1 + 7.7
+        assert now + (expiry - now) < expiry  # the raw difference does undershoot
+        wait = pool.wait_for(1, now)
+        assert now + wait >= expiry
+        assert wait == pytest.approx(expiry - now)
+
+
 class TestLiveness:
     @pytest.mark.parametrize(
         ("capacity", "refill", "cost", "start"),

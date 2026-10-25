@@ -1,7 +1,9 @@
 import asyncio
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -11,6 +13,7 @@ from rate_limit import (
     PausableRateLimiterProtocol,
     RateLimit,
     RateLimiter,
+    RateLimitPoolConflictError,
     RestRateLimiterProtocol,
     ThrottlerProtocol,
 )
@@ -34,6 +37,7 @@ from rate_limit.testing import (
     assert_conforms_token_bucket,
     assert_conforms_unpausable,
 )
+from rate_limit.testing.conformance import _UnboundUnpausable
 from rate_limit.types import Clock, RateLimitLike, Sleep
 
 
@@ -295,6 +299,114 @@ def test_conformance_detects_swallowed_body_exception() -> None:
 
     with pytest.raises(AssertionError):
         assert_conforms_throttler(lambda _l, _c, _s: Throttler())
+
+
+def test_conformance_detects_a_cancelled_acquire_that_keeps_its_charge() -> None:
+    class Leaky:
+        """Correct until an acquire is cancelled; then a phantom charge blocks every caller."""
+
+        def __init__(self, clock: Clock, sleep: Sleep, interval: float) -> None:
+            self._inner = RateLimiter([RateLimit("x", 1, interval)], clock=clock, sleep=sleep)
+            self._sleep = sleep
+            self._interval = interval
+            self._phantom = False
+
+        async def acquire(self) -> None:
+            if self._phantom:
+                await self._sleep(self._interval)
+            try:
+                await self._inner.acquire("x")
+            except asyncio.CancelledError:
+                self._phantom = True
+                raise
+
+    with pytest.raises(AssertionError, match="cancelled acquire must not record"):
+        assert_conforms_rest_limiter(lambda c, s: Leaky(c, s, 1.0), limit=1, interval=1.0)
+
+
+class SwallowingContext:
+    def __init__(self, inner: AbstractAsyncContextManager[None]) -> None:
+        self._inner = inner
+
+    async def __aenter__(self) -> None:
+        await self._inner.__aenter__()
+
+    async def __aexit__(self, *exc: object) -> bool:
+        await self._inner.__aexit__(*exc)  # type: ignore[arg-type]
+        return True
+
+
+def test_conformance_detects_a_throttler_that_swallows_the_body_exception() -> None:
+    class Swallower(RateLimiter):
+        def execute_task(  # type: ignore[override]
+            self, limit_id: str, **kw: Any
+        ) -> SwallowingContext:
+            return SwallowingContext(super().execute_task(limit_id, **kw))
+
+    with pytest.raises(AssertionError, match="must not swallow"):
+        assert_conforms_throttler(lambda limits, c, s: Swallower(limits, clock=c, sleep=s))
+
+
+def test_conformance_detects_a_throttler_that_accepts_an_undeclared_weight_key() -> None:
+    class Lenient(RateLimiter):
+        def execute_task(  # type: ignore[override]
+            self, limit_id: str, *, weights: Mapping[str, int] | None = None, **kw: Any
+        ) -> AbstractAsyncContextManager[None]:
+            kept = {k: v for k, v in (weights or {}).items() if k != "nope"}
+            return super().execute_task(limit_id, weights=kept or None, **kw)
+
+    with pytest.raises(AssertionError, match="expected ValueError"):
+        assert_conforms_throttler(
+            lambda limits, c, s: Lenient(limits, clock=c, sleep=s), weighted=True
+        )
+
+
+def test_conformance_detects_a_throttler_that_clamps_an_oversized_weight() -> None:
+    class Clamping(RateLimiter):
+        def execute_task(  # type: ignore[override]
+            self, limit_id: str, *, weights: Mapping[str, int] | None = None, **kw: Any
+        ) -> AbstractAsyncContextManager[None]:
+            clamped = {k: min(v, 10) if k == "pool" else v for k, v in (weights or {}).items()}
+            return super().execute_task(limit_id, weights=clamped or None, **kw)
+
+    with pytest.raises(AssertionError, match="must raise RateLimitWeightError"):
+        assert_conforms_throttler(
+            lambda limits, c, s: Clamping(limits, clock=c, sleep=s), weighted=True
+        )
+
+
+def test_conformance_detects_a_registry_that_accepts_a_raw_mismatch() -> None:
+    class Forgiving(RateLimiter):
+        def add_limits(self, limits: Iterable[RateLimitLike], *, owner: str | None = None) -> None:
+            try:
+                super().add_limits(limits, owner=owner)
+            except RateLimitPoolConflictError:
+                return
+
+    with pytest.raises(AssertionError, match="raw mismatch must raise"):
+        assert_conforms_throttler(
+            lambda limits, c, s: Forgiving(limits, clock=c, sleep=s), registry=True
+        )
+
+
+def test_conformance_detects_an_unpause_that_lifts_pause_all_too() -> None:
+    class Overreaching(RateLimiter):
+        def unpause(self, limit_id: str) -> None:
+            self.unpause_all()
+
+    with pytest.raises(AssertionError, match="timed out waiting for a second sleep"):
+        assert_conforms_unpausable(lambda limits, c, s: Overreaching(limits, clock=c, sleep=s))
+
+
+def test_unbound_unpausable_view_delegates_unpause_all() -> None:
+    clock = ManualClock(1000.0)
+    bound = RateLimiter([RateLimit("a", 5, 1)], clock=clock, sleep=clock.sleep).bind("a")
+    view = _UnboundUnpausable(bound)
+    view.pause("a", 60)
+    assert view.is_paused("a")
+    view.unpause_all()
+    assert not view.is_paused("a")
+    assert not bound.is_paused()
 
 
 def test_plugin_fixtures(manual_clock: ManualClock, conformance_suites: SimpleNamespace) -> None:

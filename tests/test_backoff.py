@@ -82,6 +82,14 @@ class TestExceededError:
     def test_from_response_without_headers(self) -> None:
         assert RateLimitExceededError.from_response(418).retry_after is None
 
+    def test_from_response_skips_unrelated_headers(self) -> None:
+        headers = {"Content-Type": "text/plain", "X-Request-Id": "7", "RETRY-AFTER": "9"}
+        assert RateLimitExceededError.from_response(429, headers).retry_after == 9.0
+
+    def test_from_response_without_retry_after_header(self) -> None:
+        err = RateLimitExceededError.from_response(429, {"Content-Type": "text/plain"})
+        assert err.retry_after is None
+
     def test_from_response_returns_subclass(self) -> None:
         class MineError(RateLimitExceededError):
             pass
