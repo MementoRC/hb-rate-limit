@@ -355,3 +355,34 @@ async def test_window_is_driven_by_the_injected_clock():
 
     clock.advance(0.56)
     assert await passes(throttler, "x")
+
+
+ARC_MODULE = "rate_limit.hb_compat.async_request_context_base"
+
+
+def test_arc_logger_module_global_exists():
+    module = importlib.import_module(ARC_MODULE)
+
+    assert hasattr(module, "arc_logger")
+
+
+def test_request_context_logger_is_lazily_created_and_cached(monkeypatch):
+    module = importlib.import_module(ARC_MODULE)
+    monkeypatch.setattr(module, "arc_logger", None)
+
+    first = module.AsyncRequestContextBase.logger()
+    second = module.AsyncRequestContextBase.logger()
+
+    assert isinstance(first, logging.Logger)
+    assert first.name == ARC_MODULE
+    assert second is first
+    assert module.arc_logger is first
+
+
+def test_rate_limit_repr_matches_the_legacy_text():
+    limit = RateLimit("a", 10, 1.0, 2, [LinkedLimitWeightPair("p", 3)])
+
+    assert repr(limit) == (
+        "limit_id: a, limit: 10, time interval: 1.0, weight: 2, "
+        "linked_limits: [LinkedLimitWeightPair(limit_id='p', weight=3)]"
+    )
