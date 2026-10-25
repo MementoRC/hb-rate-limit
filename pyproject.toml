@@ -52,7 +52,9 @@ quality-ci = { features = ["ci", "dev"], solve-group = "default" }
 py312 = { features = ["py312", "dev"], solve-group = "py312" }
 
 [tool.pixi.tasks]
-test = "pytest tests/"
+# CI's reusable workflow runs `pixi run test`; it enforces [tool.coverage.report] fail_under.
+test = "pytest tests/ --cov=rate_limit --cov-report=term-missing"
+test-quick = "pytest tests/"
 test-unit = "pytest tests/unit/"
 test-integration = "pytest tests/integration/"
 lint = "ruff check rate_limit tests"
