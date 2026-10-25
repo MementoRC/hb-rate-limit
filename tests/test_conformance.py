@@ -57,7 +57,31 @@ def test_pausable_conformance() -> None:
     def make(clock: Clock, sleep: Sleep) -> PausableRateLimiterProtocol:
         return RateLimiter([RateLimit("x", 100, 1)], clock=clock, sleep=sleep).bind("x")
 
-    assert_conforms_pausable(make)
+    assert assert_conforms_pausable(make) == "pool_pause"
+    assert assert_conforms_pausable(make, require_pool_pause=True) == "pool_pause"
+
+
+def test_pausable_conformance_reports_the_narrow_tier() -> None:
+    class PauseOnly:
+        def __init__(self, clock: Clock, sleep: Sleep) -> None:
+            self._inner = RateLimiter([RateLimit("x", 100, 1)], clock=clock, sleep=sleep).bind("x")
+
+        async def acquire(self) -> None:
+            await self._inner.acquire()
+
+        def pause(self, seconds: float) -> None:
+            self._inner.pause(seconds)
+
+    class NoBlockedFor(PauseOnly):
+        def is_paused(self) -> bool:
+            return self._inner.is_paused()
+
+    assert assert_conforms_pausable(PauseOnly) == "pausable"
+    assert assert_conforms_pausable(NoBlockedFor) == "pausable"
+    with pytest.raises(AssertionError, match="blocked_for"):
+        assert_conforms_pausable(NoBlockedFor, require_pool_pause=True)
+    with pytest.raises(AssertionError, match="is_paused, blocked_for"):
+        assert_conforms_pausable(PauseOnly, require_pool_pause=True)
 
 
 def test_throttler_conformance() -> None:

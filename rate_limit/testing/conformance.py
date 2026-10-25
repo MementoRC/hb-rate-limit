@@ -3,6 +3,9 @@
 Every suite takes a factory and drives it with a :class:`ManualClock`, so runs are
 deterministic with no real sleeps. The suites are synchronous (they use ``asyncio.run``):
 call them from plain test functions, not from inside a running event loop.
+
+Scenarios assume isolation: each ``make()`` call must return a fresh limiter, not shared with or
+backed by state (pause state, pools) from a previous call.
 """
 
 from __future__ import annotations
@@ -11,7 +14,7 @@ import asyncio
 import contextlib
 import inspect
 import math
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from rate_limit.backoff import BackoffPolicy
 from rate_limit.errors import RateLimitPoolConflictError, RateLimitWeightError
@@ -61,7 +64,10 @@ def _run(coro: Awaitable[None]) -> None:
 def assert_conforms_rest_limiter(
     make: Callable[[Clock, Sleep], RestRateLimiterProtocol], *, limit: int, interval: float
 ) -> None:
-    """Window accounting: ``limit`` per ``interval`` seconds, inclusive boundary."""
+    """Window accounting: ``limit`` per ``interval`` seconds, inclusive boundary.
+
+    Each ``make()`` call must return a fresh limiter (see the module docstring).
+    """
     _run(_window(make, limit, interval))
     _run(_boundary(make, limit, interval))
     _run(_concurrent(make, limit, interval))
@@ -153,11 +159,30 @@ async def _cancelled_acquire_records_nothing(
 # ---- pausable -----------------------------------------------------------------------
 
 
-def assert_conforms_pausable(make: Callable[[Clock, Sleep], PausableRateLimiterProtocol]) -> None:
-    """Pause semantics shared by every pausable limiter."""
+PausableTier = Literal["pool_pause", "pausable"]
+
+
+def assert_conforms_pausable(
+    make: Callable[[Clock, Sleep], PausableRateLimiterProtocol], *, require_pool_pause: bool = False
+) -> PausableTier:
+    """Pause semantics shared by every pausable limiter.
+
+    Returns the tier that ran: ``"pool_pause"`` when the limiter also satisfies
+    :class:`PoolPauseProtocol` (``is_paused`` / ``blocked_for`` are checked too), else
+    ``"pausable"``, which skips those checks. ``require_pool_pause=True`` raises
+    ``AssertionError`` naming the missing members instead of settling for ``"pausable"``.
+    Each ``make()`` call must return a fresh limiter (see the module docstring).
+    """
+    clock = ManualClock(_START)
+    probe = make(clock, clock.sleep)
+    tier: PausableTier = "pool_pause" if isinstance(probe, PoolPauseProtocol) else "pausable"
+    if tier == "pausable" and require_pool_pause:
+        missing = [m for m in ("is_paused", "blocked_for") if not hasattr(probe, m)]
+        raise AssertionError(f"require_pool_pause: the limiter lacks {', '.join(missing)}")
     _run(_pause_blocks(make))
     _run(_pause_never_shortens(make))
     _run(_pause_extended_while_waiting(make))
+    return tier
 
 
 async def _pause_blocks(make: Callable[[Clock, Sleep], PausableRateLimiterProtocol]) -> None:
@@ -224,7 +249,10 @@ def assert_conforms_throttler(
     weighted: bool = False,
     registry: bool = False,
 ) -> None:
-    """``execute_task`` contract, linked pools, and optionally weights and the registry."""
+    """``execute_task`` contract, linked pools, and optionally weights and the registry.
+
+    Each ``make()`` call must return a fresh limiter (see the module docstring).
+    """
     _run(_throttler_basics(make))
     _run(_throttler_linked(make))
     if weighted:
@@ -386,7 +414,10 @@ async def _throttler_registry(
 
 
 def assert_conforms_backoff(policy_factory: Callable[[], BackoffPolicy]) -> None:
-    """``BackoffPolicy.next_delay`` ordering and clamps."""
+    """``BackoffPolicy.next_delay`` ordering and clamps.
+
+    Each ``policy_factory()`` call must return a fresh policy (see the module docstring).
+    """
     policy = policy_factory()
     _require(policy.next_delay(429, 1.5) == 1.5, "Retry-After wins")
     _require(policy.next_delay(418, 0.0) == 0.0, "an explicit Retry-After of 0 wins over a ban")
@@ -436,7 +467,8 @@ def assert_conforms_token_bucket(
     """``RateLimit(kind="token_bucket")``: full burst, then ``cost / refill`` per deficit.
 
     The factory receives limits whose ``kind`` is ``"token_bucket"`` and must build a limiter
-    with no safety margin (refill is exactly ``limit / time_interval``).
+    with no safety margin (refill is exactly ``limit / time_interval``). Each ``make()`` call must
+    return a fresh limiter (see the module docstring).
     """
     _run(_bucket_burst_and_deficit(make))
     _run(_bucket_fractional_refill(make))
@@ -527,7 +559,8 @@ def assert_conforms_unpausable(
     """``unpause`` / ``unpause_all``: sleeping acquirers wake without the clock advancing.
 
     The factory's ``sleep`` is a :class:`BlockingSleep`, so a woken acquirer is the only way
-    out of a pause. The limiter must wake acquirers that are sleeping out a pause.
+    out of a pause. The limiter must wake acquirers that are sleeping out a pause. Each
+    ``make()`` call must return a fresh limiter (see the module docstring).
     """
     _run(_unpause_wakes_sleeper(make))
     _run(_unpause_keeps_pause_all(make))
@@ -679,7 +712,8 @@ def assert_conforms_bound_unpausable(
     ``make(limit, clock, sleep)`` returns the bound limiter for ``limit``. Only the scenarios
     expressible without ``pause_all`` or a second limit id are ported: an unpause wakes a
     sleeping acquirer, and an unpause keeps spent capacity. A bound-only scenario covers
-    ``unpause_all``: it lifts a pause set through the bound object and wakes its sleeper.
+    ``unpause_all``: it lifts a pause set through the bound object and wakes its sleeper. Each
+    ``make()`` call must return a fresh limiter (see the module docstring).
     """
 
     def unbound(limits: Sequence[RateLimit], clock: Clock, sleep: Sleep) -> UnpausableLimiter:
@@ -727,7 +761,8 @@ def assert_conforms_retry_after_cap(
 ) -> None:
     """``max_retry_after_seconds``: a server ``Retry-After`` is clamped, derived delays are not.
 
-    ``make(cap, clock, backoff_factory)`` builds a limiter whose cap is ``cap`` seconds.
+    ``make(cap, clock, backoff_factory)`` builds a limiter whose cap is ``cap`` seconds. Each
+    ``make()`` call must return a fresh limiter (see the module docstring).
     """
     _cap_clamps(make)
     _cap_honours_lower_values(make)
@@ -803,6 +838,7 @@ def assert_conforms_bound_retry_after_cap(
     """:func:`assert_conforms_retry_after_cap` for a limiter bound to one limit id.
 
     ``make(cap, clock, backoff_factory)`` returns the bound limiter; every scenario is ported.
+    Each ``make()`` call must return a fresh limiter (see the module docstring).
     """
 
     def unbound(
@@ -833,7 +869,8 @@ def assert_conforms_kind_change(
 
     The factory must build a limiter with no safety margin. Window to bucket becomes a deficit
     equal to the window's usage; bucket to window becomes one charge of ``ceil(used)`` stamped
-    at the switch. Retained ids of the same kind keep usage; a removed id starts fresh.
+    at the switch. Retained ids of the same kind keep usage; a removed id starts fresh. Each
+    ``make()`` call must return a fresh limiter (see the module docstring).
     """
     _run(_kind_window_to_bucket(make))
     _run(_kind_bucket_to_window(make))
@@ -941,7 +978,8 @@ def assert_conforms_refundable(
     records when a call fits, else the wait. A refund frees capacity without the clock
     advancing (window and token bucket), is idempotent, frees only its own charge, gives nothing
     back once the charge has expired (a window aged out, a bucket refilled ``cost`` since), and
-    reaches every linked pool.
+    reaches every linked pool. Each ``make()`` call must return a fresh limiter (see the module
+    docstring).
     """
     _run(_refund_restores_capacity(make))
     _run(_refund_is_idempotent(make))

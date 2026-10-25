@@ -127,6 +127,9 @@ and `report_throttled(retry_after, status=)`), `assert_conforms_bound_unpausable
 `make(limit, clock, sleep)` and `assert_conforms_bound_retry_after_cap(make)` with
 `make(cap, clock, backoff_factory)` run the same scenarios; the bound unpausable suite skips the
 `pause_all` and multi-id ones and checks the bound `unpause_all()` instead.
+`assert_conforms_pausable(make)` returns the tier it ran, `"pool_pause"` (also checks `is_paused()`
+and `blocked_for()`) or `"pausable"`; pass `require_pool_pause=True` to fail instead of falling
+back. Every `make()` call must return a fresh limiter, not one sharing state with an earlier call.
 
 ### Per-key cooldowns (KeyedCooldown)
 
@@ -164,6 +167,7 @@ return a `Charge` with `refund()`, plus `execute_task(..., refund_on_error=True)
 and `report_throttled()`, with the bound-limiter conformance suites `bound_unpausable` and
 `bound_retry_after_cap`. The kit also gains the opt-in `token_bucket`, `unpausable`,
 `retry_after_cap` and `kind_change` suites (plus `BlockingSleep`), closing the v0.2 kit gap.
+`assert_conforms_pausable` now returns its `PausableTier` and takes `require_pool_pause`.
 `acquire()` is unchanged and everything is additive, except that the `Pool` protocol gains
 `refund()`: custom `Pool` implementations must add it.
 
