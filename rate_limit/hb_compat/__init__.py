@@ -13,6 +13,17 @@ Intentional behaviour changes from legacy:
 * a ``time_interval`` <= 0 (or non-finite) raises ``ValueError``
 * no FIFO guarantee among waiters
 * ``TaskLog`` is import-only; nothing records it
+* a linked limit id that isn't registered is warned once per id by the engine (legacy dropped
+  it silently); it still runs unthrottled for that link
+* ``limit_id`` must be a non-empty str and weight / linked weight ints >= 1, or
+  ``set_rate_limits`` / ``add_rate_limits`` / the constructor raise ``ValueError`` (legacy
+  accepted anything; no parent definition violates this)
+* the exposed ``_rate_limits`` list and ``get_limit()`` objects are views: mutating them in
+  place has no effect on throttling; replace them via ``set_rate_limits``,
+  ``_rate_limits = [...]`` or ``add_rate_limits``
+* legacy parity caveat: ``_rate_limits`` holds SCALED limits, so
+  ``set_rate_limits(copy.deepcopy(t._rate_limits))`` scales again when
+  ``limits_share_percentage < 100`` (inherited legacy behaviour, unchanged)
 """
 
 from rate_limit.hb_compat.async_request_context_base import (

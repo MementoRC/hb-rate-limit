@@ -45,7 +45,7 @@ class RateLimit:
         self.weight = weight
         self.linked_limits = linked_limits or []
 
-    def __repr__(self) -> str:  # pragma: no cover - legacy debug text; no suite test renders it
+    def __repr__(self) -> str:
         return (
             f"limit_id: {self.limit_id}, limit: {self.limit}, time interval: {self.time_interval}, "
             f"weight: {self.weight}, linked_limits: {self.linked_limits}"

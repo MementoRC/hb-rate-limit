@@ -173,45 +173,59 @@ class AsyncThrottlerBase(ABC):
         )
 
     def has_limit(self, limit_id: str) -> bool:
-        return limit_id in self._id_to_limit_map
+        with self._mirror_lock:
+            return limit_id in self._id_to_limit_map
 
     def get_limit(self, limit_id: str) -> RateLimit | None:
         """The live stored (scaled) limit, or None; callers must not mutate it."""
-        return self._id_to_limit_map.get(limit_id)
+        with self._mirror_lock:
+            return self._id_to_limit_map.get(limit_id)
 
     def get_related_limits(
         self, limit_id: str
     ) -> tuple[RateLimit | None, list[tuple[RateLimit, int]]]:
         """Primary limit and its registered linked limits with weights."""
-        primary = self._id_to_limit_map.get(limit_id)
-        pairs = [] if primary is None else primary.linked_limits
-        return primary, [
-            (self._id_to_limit_map[pair.limit_id], pair.weight)
-            for pair in pairs
-            if pair.limit_id in self._id_to_limit_map
-        ]
+        with self._mirror_lock:
+            primary = self._id_to_limit_map.get(limit_id)
+            pairs = [] if primary is None else primary.linked_limits
+            return primary, [
+                (self._id_to_limit_map[pair.limit_id], pair.weight)
+                for pair in pairs
+                if pair.limit_id in self._id_to_limit_map
+            ]
+
+    def _claim_unknown(self, limit_id: str) -> bool:
+        """True exactly once per unknown id; mutes the core's duplicate warning."""
+        with self._mirror_lock:
+            if limit_id in self._id_to_limit_map or limit_id in self._warned_unknown_ids:
+                return False
+            self._warned_unknown_ids.add(limit_id)
+            # RateLimiter exposes no public hook to silence its own warn-once; seeding its set
+            # is the only way to keep a single warning per id (same distribution, tested
+            # together).
+            self._limiter._unknown_warned.add(limit_id)
+            return True
 
     def _warn_unknown(self, limit_id: str) -> None:
-        """Warn once per unknown id and per instance, and mute the core's duplicate warning."""
-        if limit_id in self._id_to_limit_map or limit_id in self._warned_unknown_ids:
-            return
-        self._warned_unknown_ids.add(limit_id)
-        # RateLimiter exposes no public hook to silence its own warn-once; seeding its set is
-        # the only way to keep a single warning per id (same distribution, tested together).
-        self._limiter._unknown_warned.add(limit_id)
-        self.logger().warning(f"Unknown rate limit id '{limit_id}': request will run unthrottled.")
+        """Warn once per unknown id and per instance (logged outside the lock)."""
+        if self._claim_unknown(limit_id):
+            self.logger().warning(
+                f"Unknown rate limit id '{limit_id}': request will run unthrottled."
+            )
 
     # ---- pauses ---------------------------------------------------------------------
 
     def pause(self, limit_id: str, seconds: float) -> None:
         """Block acquirers of ``limit_id`` and of ids linking to it; never shortens a pause."""
-        self._limiter.pause(limit_id, seconds)
-        self._paused_ids.add(limit_id)
+        with self._mirror_lock:
+            self._limiter.pause(limit_id, seconds)
+            self._paused_ids.add(limit_id)
 
     def pause_all(self, seconds: float) -> None:
         """Block every acquirer, registered or not; never shortens a pause."""
-        self._limiter.pause_all(seconds)
-        self._paused_all = True
+        with self._mirror_lock:
+            self._limiter.pause_all(seconds)
+            self._paused_all = True
 
     def unpause(self, limit_id: str) -> None:
         self._limiter.unpause(limit_id)
@@ -221,27 +235,28 @@ class AsyncThrottlerBase(ABC):
 
     def paused_until(self, limit_id: str) -> float | None:
         """Monotonic deadline of the latest pause affecting ``limit_id``; None if never paused."""
-        if not self._paused_all:
-            primary = self._id_to_limit_map.get(limit_id)
-            links = () if primary is None else primary.linked_limits
-            if self._paused_ids.isdisjoint({limit_id, *(pair.limit_id for pair in links)}):
-                return None
-        return self._limiter.paused_until(limit_id)
+        with self._mirror_lock:
+            if not self._paused_all:
+                primary = self._id_to_limit_map.get(limit_id)
+                links = () if primary is None else primary.linked_limits
+                if self._paused_ids.isdisjoint({limit_id, *(pair.limit_id for pair in links)}):
+                    return None
+            return self._limiter.paused_until(limit_id)
 
     def report_response(
         self, limit_id: str, status: int, headers: Mapping[str, str] | None = None
     ) -> RateLimitVerdict:
         """Feed an HTTP outcome to the backoff policy: 429 pauses ``limit_id``, 418 pauses all."""
-        verdict = self._limiter.report_response(limit_id, status, headers)
-        if verdict.paused_all:
-            self._paused_all = True
-        elif verdict.rate_limited:
-            self._paused_ids.add(limit_id)
+        with self._mirror_lock:
+            verdict = self._limiter.report_response(limit_id, status, headers)
+            if verdict.paused_all:
+                self._paused_all = True
+            elif verdict.rate_limited:
+                self._paused_ids.add(limit_id)
         return verdict
 
-    def _validate_weights(self, limit_id: str, weights: Mapping[str, int]) -> None:
-        """Raise ValueError unless every key is the primary or a registered linked id and every
-        value is an int >= 1 (bool rejected)."""
+    def _allowed_weight_keys_locked(self, limit_id: str) -> set[str]:
+        """Caller must hold ``_mirror_lock``."""
         primary = self._id_to_limit_map.get(limit_id)
         allowed: set[str] = set()
         if primary is not None:
@@ -251,6 +266,13 @@ class AsyncThrottlerBase(ABC):
                 for pair in primary.linked_limits
                 if pair.limit_id in self._id_to_limit_map
             )
+        return allowed
+
+    def _validate_weights(self, limit_id: str, weights: Mapping[str, int]) -> None:
+        """Raise ValueError unless every key is the primary or a registered linked id and every
+        value is an int >= 1 (bool rejected)."""
+        with self._mirror_lock:
+            allowed = self._allowed_weight_keys_locked(limit_id)
         for key, weight in weights.items():
             if key not in allowed:
                 raise ValueError(
