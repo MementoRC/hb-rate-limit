@@ -3,6 +3,9 @@
 Every suite takes a factory and drives it with a :class:`ManualClock`, so runs are
 deterministic with no real sleeps. The suites are synchronous (they use ``asyncio.run``):
 call them from plain test functions, not from inside a running event loop.
+
+Scenarios assume isolation: each ``make()`` call must return a fresh limiter, not shared with or
+backed by state (pause state, pools) from a previous call.
 """
 
 from __future__ import annotations
@@ -11,7 +14,7 @@ import asyncio
 import contextlib
 import inspect
 import math
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from rate_limit.backoff import BackoffPolicy
 from rate_limit.errors import RateLimitPoolConflictError, RateLimitWeightError
@@ -26,7 +29,7 @@ from rate_limit.testing.clock import BlockingSleep, ManualClock
 from rate_limit.types import Clock, LinkedLimitWeightPair, RateLimit, Sleep
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable, Sequence
+    from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 
     from rate_limit.backoff import RateLimitVerdict
     from rate_limit.types import PoolKind, RateLimitLike
@@ -61,7 +64,10 @@ def _run(coro: Awaitable[None]) -> None:
 def assert_conforms_rest_limiter(
     make: Callable[[Clock, Sleep], RestRateLimiterProtocol], *, limit: int, interval: float
 ) -> None:
-    """Window accounting: ``limit`` per ``interval`` seconds, inclusive boundary."""
+    """Window accounting: ``limit`` per ``interval`` seconds, inclusive boundary.
+
+    Each ``make()`` call must return a fresh limiter (see the module docstring).
+    """
     _run(_window(make, limit, interval))
     _run(_boundary(make, limit, interval))
     _run(_concurrent(make, limit, interval))
@@ -153,11 +159,30 @@ async def _cancelled_acquire_records_nothing(
 # ---- pausable -----------------------------------------------------------------------
 
 
-def assert_conforms_pausable(make: Callable[[Clock, Sleep], PausableRateLimiterProtocol]) -> None:
-    """Pause semantics shared by every pausable limiter."""
+PausableTier = Literal["pool_pause", "pausable"]
+
+
+def assert_conforms_pausable(
+    make: Callable[[Clock, Sleep], PausableRateLimiterProtocol], *, require_pool_pause: bool = False
+) -> PausableTier:
+    """Pause semantics shared by every pausable limiter.
+
+    Returns the tier that ran: ``"pool_pause"`` when the limiter also satisfies
+    :class:`PoolPauseProtocol` (``is_paused`` / ``blocked_for`` are checked too), else
+    ``"pausable"``, which skips those checks. ``require_pool_pause=True`` raises
+    ``AssertionError`` naming the missing members instead of settling for ``"pausable"``.
+    Each ``make()`` call must return a fresh limiter (see the module docstring).
+    """
+    clock = ManualClock(_START)
+    probe = make(clock, clock.sleep)
+    tier: PausableTier = "pool_pause" if isinstance(probe, PoolPauseProtocol) else "pausable"
+    if tier == "pausable" and require_pool_pause:
+        missing = [m for m in ("is_paused", "blocked_for") if not hasattr(probe, m)]
+        raise AssertionError(f"require_pool_pause: the limiter lacks {', '.join(missing)}")
     _run(_pause_blocks(make))
     _run(_pause_never_shortens(make))
     _run(_pause_extended_while_waiting(make))
+    return tier
 
 
 async def _pause_blocks(make: Callable[[Clock, Sleep], PausableRateLimiterProtocol]) -> None:
@@ -224,7 +249,10 @@ def assert_conforms_throttler(
     weighted: bool = False,
     registry: bool = False,
 ) -> None:
-    """``execute_task`` contract, linked pools, and optionally weights and the registry."""
+    """``execute_task`` contract, linked pools, and optionally weights and the registry.
+
+    Each ``make()`` call must return a fresh limiter (see the module docstring).
+    """
     _run(_throttler_basics(make))
     _run(_throttler_linked(make))
     if weighted:
@@ -386,7 +414,10 @@ async def _throttler_registry(
 
 
 def assert_conforms_backoff(policy_factory: Callable[[], BackoffPolicy]) -> None:
-    """``BackoffPolicy.next_delay`` ordering and clamps."""
+    """``BackoffPolicy.next_delay`` ordering and clamps.
+
+    Each ``policy_factory()`` call must return a fresh policy (see the module docstring).
+    """
     policy = policy_factory()
     _require(policy.next_delay(429, 1.5) == 1.5, "Retry-After wins")
     _require(policy.next_delay(418, 0.0) == 0.0, "an explicit Retry-After of 0 wins over a ban")
@@ -436,7 +467,8 @@ def assert_conforms_token_bucket(
     """``RateLimit(kind="token_bucket")``: full burst, then ``cost / refill`` per deficit.
 
     The factory receives limits whose ``kind`` is ``"token_bucket"`` and must build a limiter
-    with no safety margin (refill is exactly ``limit / time_interval``).
+    with no safety margin (refill is exactly ``limit / time_interval``). Each ``make()`` call must
+    return a fresh limiter (see the module docstring).
     """
     _run(_bucket_burst_and_deficit(make))
     _run(_bucket_fractional_refill(make))
@@ -527,7 +559,8 @@ def assert_conforms_unpausable(
     """``unpause`` / ``unpause_all``: sleeping acquirers wake without the clock advancing.
 
     The factory's ``sleep`` is a :class:`BlockingSleep`, so a woken acquirer is the only way
-    out of a pause. The limiter must wake acquirers that are sleeping out a pause.
+    out of a pause. The limiter must wake acquirers that are sleeping out a pause. Each
+    ``make()`` call must return a fresh limiter (see the module docstring).
     """
     _run(_unpause_wakes_sleeper(make))
     _run(_unpause_keeps_pause_all(make))
@@ -632,6 +665,84 @@ async def _unpause_keeps_spent_capacity(
         await _abandon(task)
 
 
+class BoundUnpausableLimiter(Protocol):
+    """Opt-in surface for :func:`assert_conforms_bound_unpausable` (``BoundLimiter`` fits)."""
+
+    async def acquire(self) -> None: ...
+
+    def pause(self, seconds: float) -> None: ...
+
+    def unpause(self) -> None: ...
+
+    def unpause_all(self) -> None: ...
+
+    def is_paused(self) -> bool: ...
+
+
+class _UnboundUnpausable:
+    """Id-taking view of a bound limiter, so the unpause scenarios run unchanged."""
+
+    def __init__(self, bound: BoundUnpausableLimiter) -> None:
+        self._bound = bound
+
+    async def acquire(self, limit_id: str) -> None:
+        await self._bound.acquire()
+
+    def pause(self, limit_id: str, seconds: float) -> None:
+        self._bound.pause(seconds)
+
+    def pause_all(self, seconds: float) -> None:
+        raise NotImplementedError("a bound limiter has no pause_all")
+
+    def unpause(self, limit_id: str) -> None:
+        self._bound.unpause()
+
+    def unpause_all(self) -> None:
+        self._bound.unpause_all()
+
+    def is_paused(self, limit_id: str) -> bool:
+        return self._bound.is_paused()
+
+
+def assert_conforms_bound_unpausable(
+    make: Callable[[RateLimit, Clock, Sleep], BoundUnpausableLimiter],
+) -> None:
+    """:func:`assert_conforms_unpausable` for a limiter bound to one limit id.
+
+    ``make(limit, clock, sleep)`` returns the bound limiter for ``limit``. Only the scenarios
+    expressible without ``pause_all`` or a second limit id are ported: an unpause wakes a
+    sleeping acquirer, and an unpause keeps spent capacity. A bound-only scenario covers
+    ``unpause_all``: it lifts a pause set through the bound object and wakes its sleeper. Each
+    ``make()`` call must return a fresh limiter (see the module docstring).
+    """
+
+    def unbound(limits: Sequence[RateLimit], clock: Clock, sleep: Sleep) -> UnpausableLimiter:
+        return _UnboundUnpausable(make(limits[0], clock, sleep))
+
+    _run(_unpause_wakes_sleeper(unbound))
+    _run(_unpause_keeps_spent_capacity(unbound))
+    _run(_bound_unpause_all_wakes_sleeper(make))
+
+
+async def _bound_unpause_all_wakes_sleeper(
+    make: Callable[[RateLimit, Clock, Sleep], BoundUnpausableLimiter],
+) -> None:
+    clock, sleeper = ManualClock(_START), BlockingSleep()
+    bound = make(RateLimit("a", 5, 1.0), clock, sleeper)
+    bound.pause(7200.0)
+    task = asyncio.create_task(bound.acquire())
+    try:
+        await asyncio.wait_for(sleeper.started.wait(), timeout=1.0)
+        _require(not task.done(), "an acquirer must wait out a pause")
+        bound.unpause_all()
+        await _finishes(task, "unpause_all")
+    finally:
+        await _abandon(task)
+    _require(clock() == _START, "unpause_all must not need the clock to advance")
+    _require(_close(sleeper.durations[0], 7200.0), f"slept the pause: {sleeper.durations}")
+    _require(not bound.is_paused(), "unpause_all must lift the pause")
+
+
 # ---- Retry-After cap ----------------------------------------------------------------
 
 
@@ -650,7 +761,8 @@ def assert_conforms_retry_after_cap(
 ) -> None:
     """``max_retry_after_seconds``: a server ``Retry-After`` is clamped, derived delays are not.
 
-    ``make(cap, clock, backoff_factory)`` builds a limiter whose cap is ``cap`` seconds.
+    ``make(cap, clock, backoff_factory)`` builds a limiter whose cap is ``cap`` seconds. Each
+    ``make()`` call must return a fresh limiter (see the module docstring).
     """
     _cap_clamps(make)
     _cap_honours_lower_values(make)
@@ -695,6 +807,50 @@ def _cap_spares_backoff_delays(
     _require(verdict.retry_after is None, f"no Retry-After was sent: {verdict}")
 
 
+class BoundRetryAfterCapLimiter(Protocol):
+    """Opt-in surface for :func:`assert_conforms_bound_retry_after_cap`."""
+
+    def report_throttled(
+        self, retry_after: float | None = None, *, status: int | None = None
+    ) -> RateLimitVerdict: ...
+
+    def paused_until(self) -> float: ...
+
+
+class _UnboundRetryAfterCap:
+    """Id-taking view of a bound limiter, so the cap scenarios run unchanged."""
+
+    def __init__(self, bound: BoundRetryAfterCapLimiter) -> None:
+        self._bound = bound
+
+    def report_throttled(
+        self, limit_id: str, retry_after: float | None = None, *, status: int | None = None
+    ) -> RateLimitVerdict:
+        return self._bound.report_throttled(retry_after, status=status)
+
+    def paused_until(self, limit_id: str) -> float:
+        return self._bound.paused_until()
+
+
+def assert_conforms_bound_retry_after_cap(
+    make: Callable[[float, Clock, Callable[[], BackoffPolicy]], BoundRetryAfterCapLimiter],
+) -> None:
+    """:func:`assert_conforms_retry_after_cap` for a limiter bound to one limit id.
+
+    ``make(cap, clock, backoff_factory)`` returns the bound limiter; every scenario is ported.
+    Each ``make()`` call must return a fresh limiter (see the module docstring).
+    """
+
+    def unbound(
+        cap: float, clock: Clock, backoff: Callable[[], BackoffPolicy]
+    ) -> RetryAfterCapLimiter:
+        return _UnboundRetryAfterCap(make(cap, clock, backoff))
+
+    _cap_clamps(unbound)
+    _cap_honours_lower_values(unbound)
+    _cap_spares_backoff_delays(unbound)
+
+
 # ---- kind change --------------------------------------------------------------------
 
 
@@ -713,7 +869,8 @@ def assert_conforms_kind_change(
 
     The factory must build a limiter with no safety margin. Window to bucket becomes a deficit
     equal to the window's usage; bucket to window becomes one charge of ``ceil(used)`` stamped
-    at the switch. Retained ids of the same kind keep usage; a removed id starts fresh.
+    at the switch. Retained ids of the same kind keep usage; a removed id starts fresh. Each
+    ``make()`` call must return a fresh limiter (see the module docstring).
     """
     _run(_kind_window_to_bucket(make))
     _run(_kind_bucket_to_window(make))
@@ -791,3 +948,139 @@ async def _kind_removed_id_starts_fresh(
     limiter.set_limits([_kind_limit("window"), _kind_limit("window", "other")])
     await _spend(limiter, _KIND_LIMIT)
     _require(clock.sleeps == [], "an id removed then re-added must start with a fresh pool")
+
+
+# ---- refunds ------------------------------------------------------------------------
+
+
+class RefundableCharge(Protocol):
+    """What :meth:`RefundableLimiter.reserve` returns (``Charge`` satisfies it)."""
+
+    def refund(self) -> None: ...
+
+
+class RefundableLimiter(Protocol):
+    """Opt-in surface for :func:`assert_conforms_refundable` (``RateLimiter`` satisfies it)."""
+
+    async def reserve(
+        self, limit_id: str, weights: Mapping[str, int] | None = None
+    ) -> RefundableCharge: ...
+
+    def try_acquire(self, limit_id: str, weights: Mapping[str, int] | None = None) -> float: ...
+
+
+def assert_conforms_refundable(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    """``reserve()`` returns a charge whose ``refund()`` hands its capacity straight back.
+
+    The factory must build a limiter with no safety margin; ``try_acquire`` returns 0.0 and
+    records when a call fits, else the wait. A refund frees capacity without the clock
+    advancing (window and token bucket), is idempotent, frees only its own charge, gives nothing
+    back once the charge has expired (a window aged out, a bucket refilled ``cost`` since), and
+    reaches every linked pool. Each ``make()`` call must return a fresh limiter (see the module
+    docstring).
+    """
+    _run(_refund_restores_capacity(make))
+    _run(_refund_is_idempotent(make))
+    _run(_refund_leaves_other_charges(make))
+    _run(_refund_after_expiry_is_a_noop(make))
+    _run(_refund_covers_linked_pools(make))
+
+
+_REFUND_INTERVAL = 10.0
+_REFUND_KINDS: tuple[PoolKind, ...] = ("window", "token_bucket")
+
+
+def _refund_limit(kind: PoolKind = "window") -> RateLimit:
+    return RateLimit("a", 2, _REFUND_INTERVAL, kind=kind)
+
+
+def _full(limiter: RefundableLimiter, what: str) -> None:
+    _require(limiter.try_acquire("a") > 0, f"{what}: the pool must be full")
+
+
+async def _refund_restores_capacity(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    for kind in _REFUND_KINDS:
+        clock = ManualClock(_START)
+        limiter = make([_refund_limit(kind)], clock, clock.sleep)
+        charge = await limiter.reserve("a")
+        await limiter.reserve("a")
+        _full(limiter, f"{kind} after two charges")
+        charge.refund()
+        _require(limiter.try_acquire("a") == 0.0, f"a {kind} refund must free its charge at once")
+        _full(limiter, f"a {kind} refund frees its own charge, no more")
+        _require(clock.sleeps == [], f"{kind}: nothing here may sleep: {clock.sleeps}")
+
+
+async def _refund_is_idempotent(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    for kind in _REFUND_KINDS:
+        clock = ManualClock(_START)
+        limiter = make([_refund_limit(kind)], clock, clock.sleep)
+        charge = await limiter.reserve("a")
+        await limiter.reserve("a")
+        charge.refund()
+        charge.refund()
+        _require(limiter.try_acquire("a") == 0.0, f"a {kind} refund must free its charge")
+        _full(limiter, f"a second {kind} refund must not credit again")
+
+
+async def _refund_leaves_other_charges(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    # window: the second charge expires a full interval after it; bucket: refunding the first
+    # leaves exactly one token (the refill during the 1s gap is not credited twice)
+    cases: list[tuple[PoolKind, float]] = [
+        ("window", _REFUND_INTERVAL),
+        ("token_bucket", _REFUND_INTERVAL / 2),
+    ]
+    for kind, expected in cases:
+        clock = ManualClock(_START)
+        limiter = make([_refund_limit(kind)], clock, clock.sleep)
+        first = await limiter.reserve("a")
+        clock.advance(1.0)
+        await limiter.reserve("a")
+        first.refund()
+        _require(limiter.try_acquire("a") == 0.0, f"refunding a first {kind} charge frees one")
+        wait = limiter.try_acquire("a")
+        _require(_close(wait, expected), f"the second {kind} charge must still count: {wait}")
+
+
+async def _refund_after_expiry_is_a_noop(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    for kind in _REFUND_KINDS:  # older than the window, and than cost / refill for a bucket
+        clock = ManualClock(_START)
+        limiter = make([_refund_limit(kind)], clock, clock.sleep)
+        stale = await limiter.reserve("a")
+        clock.advance(_REFUND_INTERVAL * 1.001)
+        await limiter.reserve("a")
+        await limiter.reserve("a")
+        stale.refund()
+        _full(limiter, f"refunding an expired {kind} charge must not add headroom")
+
+
+async def _refund_covers_linked_pools(
+    make: Callable[[Sequence[RateLimit], Clock, Sleep], RefundableLimiter],
+) -> None:
+    clock = ManualClock(_START)
+    link = [LinkedLimitWeightPair("shared", 1)]
+    limiter = make(
+        [
+            RateLimit("a", 1, _REFUND_INTERVAL, linked_limits=link),
+            RateLimit("b", 1, _REFUND_INTERVAL, linked_limits=link),
+            RateLimit("shared", 1, _REFUND_INTERVAL),
+        ],
+        clock,
+        clock.sleep,
+    )
+    charge = await limiter.reserve("a")
+    _require(limiter.try_acquire("b") > 0, "the linked pool must be charged")
+    charge.refund()
+    _require(
+        limiter.try_acquire("a") == 0.0, "the refund must reach the primary and the linked pool"
+    )

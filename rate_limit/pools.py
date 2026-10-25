@@ -44,6 +44,13 @@ class Pool(Protocol):
         """Record ``cost`` and return 0.0 if it fits, else return the wait and record nothing."""
         ...
 
+    def refund(self, cost: int, stamp: float, now: float) -> float:
+        """Hand back a charge of ``cost`` reserved at ``stamp``; returns the amount returned.
+
+        Evicts at ``now`` first, so a charge that has already stopped counting returns 0.0.
+        """
+        ...
+
 
 class SlidingWindowPool:
     """Weighted sliding window with an inclusive boundary.
@@ -109,6 +116,20 @@ class SlidingWindowPool:
         self._history.append((now, cost))
         self._used += cost
         return 0.0
+
+    def refund(self, cost: int, stamp: float, now: float) -> float:
+        """Remove one history entry equal to ``(stamp, cost)``; 0.0 if none is left.
+
+        None is left once the charge has expired, or when a bucket-to-window carry-over replaced
+        it. A same-kind rebuild shares the history, so a refund still finds its entry there.
+        """
+        self.evict(now)
+        try:
+            self._history.remove((stamp, cost))
+        except ValueError:
+            return 0.0
+        self._used -= cost
+        return float(cost)
 
 
 class TokenBucketPool:
@@ -189,6 +210,21 @@ class TokenBucketPool:
         self.evict(now)
         self._tokens -= cost
         return 0.0
+
+    def refund(self, cost: int, stamp: float, now: float) -> float:
+        """Refill to ``now``, then return ``min(used, cost - refill * (now - stamp))`` (>= 0).
+
+        A bucket keeps no per-charge record, so this bounds the charge's remaining effect: the gap
+        between the never-charged and the actual bucket starts at ``cost`` and only shrinks, at
+        most at the refill rate, while the never-charged one sits at capacity. Provided the rate
+        was fixed since ``stamp`` (the limiter ends a charge's refundability when it changes),
+        it never over-credits, and it is exact when no clamping happened in between.
+        """
+        self.evict(now)
+        unrefilled = max(0.0, cost - self._refill * max(0.0, now - stamp))
+        returned = min(self.used, unrefilled)
+        self._tokens = min(self._capacity, self._tokens + returned)
+        return returned
 
 
 def new_pool(kind: PoolKind, limit: int, time_interval: float, margin_pct: float) -> Pool:

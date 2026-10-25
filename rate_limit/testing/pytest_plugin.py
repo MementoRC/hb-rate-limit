@@ -5,8 +5,8 @@ Provides fixtures for consumer tests that drive the conformance kit:
 * ``manual_clock``: a fresh :class:`ManualClock`
 * ``reset_pool_limiters``: autouse isolation for the process-wide pool registry
 * ``conformance_suites``: the ``assert_conforms_*`` functions as a namespace; ``token_bucket``,
-  ``unpausable``, ``retry_after_cap`` and ``kind_change`` are opt-in (run them only if you claim
-  the feature)
+  ``unpausable``, ``retry_after_cap``, ``bound_unpausable``, ``bound_retry_after_cap``,
+  ``kind_change`` and ``refundable`` are opt-in (run them only if you claim the feature)
 """
 
 from __future__ import annotations
@@ -46,5 +46,8 @@ def conformance_suites() -> SimpleNamespace:
         token_bucket=conformance.assert_conforms_token_bucket,
         unpausable=conformance.assert_conforms_unpausable,
         retry_after_cap=conformance.assert_conforms_retry_after_cap,
+        bound_unpausable=conformance.assert_conforms_bound_unpausable,
+        bound_retry_after_cap=conformance.assert_conforms_bound_retry_after_cap,
         kind_change=conformance.assert_conforms_kind_change,
+        refundable=conformance.assert_conforms_refundable,
     )

@@ -77,29 +77,104 @@ limiter.report_response("feed", 429, {"Retry-After": "7200"})  # paused for 120s
 limiter.unpause("feed")  # or limiter.unpause_all()
 ```
 
+### Refunding a charge
+
+`reserve()` waits exactly like `acquire()` but returns a `Charge` receipt. If the request never
+went out (signing failed, say), `charge.refund()` hands the capacity back on every pool it
+charged. A refund is idempotent and thread-safe; it is skipped for a limit id that has since been
+removed (even if re-added) or changed kind or refill rate, and an expired charge gives nothing
+back. A token bucket does not track individual charges, so it returns only the part that cannot
+have refilled yet, `min(used, cost - refill * elapsed)`, which never over-credits. Waiters are
+not woken early: they pick up the capacity when they next re-assess.
+
+Use `refund_on_error=True` only for bodies that fail before the request reaches the venue
+(signing, validation). An exception raised after sending (a 429, a response timeout, a parse
+error) means the venue already counted the request, so refunding under-throttles; there, use
+`reserve()` and refund explicitly.
+
+```python
+charge = await limiter.reserve("klines")
+try:
+    signed = sign(order)
+except SigningError:
+    charge.refund()  # nothing was sent: give the weight back
+    raise
+await send(signed)
+
+# or let the context manager do it: an Exception in the body refunds, cancellation does not
+async with limiter.execute_task("klines", refund_on_error=True):
+    signed = sign(order)  # only pre-send work in here
+await send(signed)
+```
+
+`limiter.bind("klines").reserve()` does the same with the bound weights.
+
 Share one budget across instances with `get_pool_limiter(pool_key, limit)`; the kind and
 `safety_margin_pct` (default 0.0; hb_compat shims pass 0.05) are part of the pool's identity.
 The `run_paced` / `note_rate_limited` helpers take an optional `clock=` for limiters that can
 pause but cannot report `is_paused()`. Tests use `rate_limit.testing.ManualClock` and the
-`assert_conforms_*` suites. Four opt-in suites cover features that are not part of the
-required protocols; run one only if your limiter claims the feature (each is also a
+`assert_conforms_*` suites. Opt-in suites cover features that are not part of the required
+protocols; run one only if your limiter claims the feature (each is also a
 `conformance_suites` fixture attribute): `assert_conforms_token_bucket(make)` with
 `make(limits, clock, sleep)`, `assert_conforms_unpausable(make)` with `make(limits, clock, sleep)`
 (driven by `rate_limit.testing.BlockingSleep`), `assert_conforms_retry_after_cap(make)` with
-`make(cap, clock, backoff_factory)`, and `assert_conforms_kind_change(make)` with
-`make(limits, clock, sleep)` (`set_limits` carries usage across a window / token-bucket switch).
+`make(cap, clock, backoff_factory)`, `assert_conforms_kind_change(make)` with
+`make(limits, clock, sleep)` (`set_limits` carries usage across a window / token-bucket switch),
+and `assert_conforms_refundable(make)` with `make(limits, clock, sleep)` (`reserve()` returns a
+charge whose `refund()` frees its capacity at once, exactly once, on every linked pool).
+For a limiter bound to one limit id (`limiter.bind("x")`, which also forwards `paused_until()`
+and `report_throttled(retry_after, status=)`), `assert_conforms_bound_unpausable(make)` with
+`make(limit, clock, sleep)` and `assert_conforms_bound_retry_after_cap(make)` with
+`make(cap, clock, backoff_factory)` run the same scenarios; the bound unpausable suite skips the
+`pause_all` and multi-id ones and checks the bound `unpause_all()` instead.
+`assert_conforms_pausable(make)` returns the tier it ran, `"pool_pause"` (also checks `is_paused()`
+and `blocked_for()`) or `"pausable"`; pass `require_pool_pause=True` to fail instead of falling
+back. Every `make()` call must return a fresh limiter, not one sharing state with an earlier call.
+
+### Per-key cooldowns (KeyedCooldown)
+
+`KeyedCooldown(limit, time_interval)` keeps one sliding window per hashable key, with the same
+inclusive boundary as the limiter's windows. Interactive Brokers allows no identical request within
+15 seconds, and at most six requests per (contract, exchange, tickType) per 2 seconds:
+
+```python
+from rate_limit import KeyedCooldown
+
+identical = KeyedCooldown(1, 15.0)
+per_tick = KeyedCooldown(6, 2.0)
+
+async with limiter.execute_task("ib_messages"):  # the global limit first
+    await per_tick.acquire((con_id, exchange, tick_type))
+    await identical.acquire(request_key)  # cooldowns last, right before the send
+    await send(request)
+```
+
+It has the limiter's `acquire` / `try_acquire` / `blocked_for` shape with a key and an optional
+weight (`weight > limit` raises `RateLimitWeightError`), plus `reset(key)` / `reset()` and
+`len()` for the keys tracked. A key's window is created on its first charge (`blocked_for` never
+creates one) and dropped once empty, so memory stays bounded without sweeping every key.
+`KeyedCooldown` is independent of `RateLimiter` and not atomic with it: acquire the limiter first
+and the cooldowns immediately before sending, so each key's stamp is as close as possible to the
+real send.
 
 ---
 
 ## Status
 
+v0.3.0: ships `py.typed`; refund receipts, where `RateLimiter.reserve()` / `BoundLimiter.reserve()`
+return a `Charge` with `refund()`, plus `execute_task(..., refund_on_error=True)` and an opt-in
+`refundable` conformance suite; `KeyedCooldown` for per-key windows; `BoundLimiter.paused_until()`
+and `report_throttled()`, with the bound-limiter conformance suites `bound_unpausable` and
+`bound_retry_after_cap`. The kit also gains the opt-in `token_bucket`, `unpausable`,
+`retry_after_cap` and `kind_change` suites (plus `BlockingSleep`), closing the v0.2 kit gap.
+`assert_conforms_pausable` now returns its `PausableTier` and takes `require_pool_pause`.
+`acquire()` is unchanged and everything is additive, except that the `Pool` protocol gains
+`refund()`: custom `Pool` implementations must add it.
+
 v0.2.0: adds `TokenBucketPool` (per-limit `kind="token_bucket"`), `unpause` / `unpause_all`, an
 opt-in `max_retry_after_seconds` cap, `safety_margin_pct` on `get_pool_limiter`, and an optional
 `clock` for the pacing helpers. v0.1.0 shipped sliding-window pools, the registry, pause/backoff,
 helpers and the conformance kit.
-
-Unreleased: the conformance kit gains opt-in `token_bucket`, `unpausable`, `retry_after_cap` and
-`kind_change` suites (plus `BlockingSleep`), closing the v0.2 kit gap.
 
 ---
 
