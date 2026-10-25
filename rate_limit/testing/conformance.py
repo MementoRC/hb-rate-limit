@@ -677,9 +677,9 @@ def assert_conforms_bound_unpausable(
     """:func:`assert_conforms_unpausable` for a limiter bound to one limit id.
 
     ``make(limit, clock, sleep)`` returns the bound limiter for ``limit``. Only the scenarios
-    expressible without ``pause_all`` or a second limit id run: an unpause wakes a sleeping
-    acquirer, and an unpause keeps spent capacity. The pause_all and multi-id scenarios are
-    skipped.
+    expressible without ``pause_all`` or a second limit id are ported: an unpause wakes a
+    sleeping acquirer, and an unpause keeps spent capacity. A bound-only scenario covers
+    ``unpause_all``: it lifts a pause set through the bound object and wakes its sleeper.
     """
 
     def unbound(limits: Sequence[RateLimit], clock: Clock, sleep: Sleep) -> UnpausableLimiter:
@@ -687,6 +687,26 @@ def assert_conforms_bound_unpausable(
 
     _run(_unpause_wakes_sleeper(unbound))
     _run(_unpause_keeps_spent_capacity(unbound))
+    _run(_bound_unpause_all_wakes_sleeper(make))
+
+
+async def _bound_unpause_all_wakes_sleeper(
+    make: Callable[[RateLimit, Clock, Sleep], BoundUnpausableLimiter],
+) -> None:
+    clock, sleeper = ManualClock(_START), BlockingSleep()
+    bound = make(RateLimit("a", 5, 1.0), clock, sleeper)
+    bound.pause(7200.0)
+    task = asyncio.create_task(bound.acquire())
+    try:
+        await asyncio.wait_for(sleeper.started.wait(), timeout=1.0)
+        _require(not task.done(), "an acquirer must wait out a pause")
+        bound.unpause_all()
+        await _finishes(task, "unpause_all")
+    finally:
+        await _abandon(task)
+    _require(clock() == _START, "unpause_all must not need the clock to advance")
+    _require(_close(sleeper.durations[0], 7200.0), f"slept the pause: {sleeper.durations}")
+    _require(not bound.is_paused(), "unpause_all must lift the pause")
 
 
 # ---- Retry-After cap ----------------------------------------------------------------

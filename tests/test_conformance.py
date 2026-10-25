@@ -168,6 +168,18 @@ def test_conformance_detects_a_bound_limiter_that_ignores_unpause() -> None:
         assert_conforms_bound_unpausable(make)
 
 
+def test_conformance_detects_a_bound_limiter_that_ignores_unpause_all() -> None:
+    class DeafToAll(RateLimiter):
+        def unpause_all(self) -> None:
+            return None
+
+    def make(limit: RateLimit, clock: Clock, sleep: Sleep) -> BoundUnpausableLimiter:
+        return DeafToAll([limit], clock=clock, sleep=sleep).bind(limit.limit_id)
+
+    with pytest.raises(AssertionError, match="unpause_all"):
+        assert_conforms_bound_unpausable(make)
+
+
 def test_conformance_detects_an_uncapped_bound_limiter() -> None:
     def make(
         cap: float, clock: Clock, backoff_factory: Callable[[], BackoffPolicy]
