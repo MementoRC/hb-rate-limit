@@ -632,6 +632,63 @@ async def _unpause_keeps_spent_capacity(
         await _abandon(task)
 
 
+class BoundUnpausableLimiter(Protocol):
+    """Opt-in surface for :func:`assert_conforms_bound_unpausable` (``BoundLimiter`` fits)."""
+
+    async def acquire(self) -> None: ...
+
+    def pause(self, seconds: float) -> None: ...
+
+    def unpause(self) -> None: ...
+
+    def unpause_all(self) -> None: ...
+
+    def is_paused(self) -> bool: ...
+
+
+class _UnboundUnpausable:
+    """Id-taking view of a bound limiter, so the unpause scenarios run unchanged."""
+
+    def __init__(self, bound: BoundUnpausableLimiter) -> None:
+        self._bound = bound
+
+    async def acquire(self, limit_id: str) -> None:
+        await self._bound.acquire()
+
+    def pause(self, limit_id: str, seconds: float) -> None:
+        self._bound.pause(seconds)
+
+    def pause_all(self, seconds: float) -> None:
+        raise NotImplementedError("a bound limiter has no pause_all")
+
+    def unpause(self, limit_id: str) -> None:
+        self._bound.unpause()
+
+    def unpause_all(self) -> None:
+        self._bound.unpause_all()
+
+    def is_paused(self, limit_id: str) -> bool:
+        return self._bound.is_paused()
+
+
+def assert_conforms_bound_unpausable(
+    make: Callable[[RateLimit, Clock, Sleep], BoundUnpausableLimiter],
+) -> None:
+    """:func:`assert_conforms_unpausable` for a limiter bound to one limit id.
+
+    ``make(limit, clock, sleep)`` returns the bound limiter for ``limit``. Only the scenarios
+    expressible without ``pause_all`` or a second limit id run: an unpause wakes a sleeping
+    acquirer, and an unpause keeps spent capacity. The pause_all and multi-id scenarios are
+    skipped.
+    """
+
+    def unbound(limits: Sequence[RateLimit], clock: Clock, sleep: Sleep) -> UnpausableLimiter:
+        return _UnboundUnpausable(make(limits[0], clock, sleep))
+
+    _run(_unpause_wakes_sleeper(unbound))
+    _run(_unpause_keeps_spent_capacity(unbound))
+
+
 # ---- Retry-After cap ----------------------------------------------------------------
 
 
@@ -693,6 +750,49 @@ def _cap_spares_backoff_delays(
     verdict = limiter.report_throttled("a")
     _require(_close(verdict.delay, 30.0), f"a backoff-derived delay is never capped: {verdict}")
     _require(verdict.retry_after is None, f"no Retry-After was sent: {verdict}")
+
+
+class BoundRetryAfterCapLimiter(Protocol):
+    """Opt-in surface for :func:`assert_conforms_bound_retry_after_cap`."""
+
+    def report_throttled(
+        self, retry_after: float | None = None, *, status: int | None = None
+    ) -> RateLimitVerdict: ...
+
+    def paused_until(self) -> float: ...
+
+
+class _UnboundRetryAfterCap:
+    """Id-taking view of a bound limiter, so the cap scenarios run unchanged."""
+
+    def __init__(self, bound: BoundRetryAfterCapLimiter) -> None:
+        self._bound = bound
+
+    def report_throttled(
+        self, limit_id: str, retry_after: float | None = None, *, status: int | None = None
+    ) -> RateLimitVerdict:
+        return self._bound.report_throttled(retry_after, status=status)
+
+    def paused_until(self, limit_id: str) -> float:
+        return self._bound.paused_until()
+
+
+def assert_conforms_bound_retry_after_cap(
+    make: Callable[[float, Clock, Callable[[], BackoffPolicy]], BoundRetryAfterCapLimiter],
+) -> None:
+    """:func:`assert_conforms_retry_after_cap` for a limiter bound to one limit id.
+
+    ``make(cap, clock, backoff_factory)`` returns the bound limiter; every scenario is ported.
+    """
+
+    def unbound(
+        cap: float, clock: Clock, backoff: Callable[[], BackoffPolicy]
+    ) -> RetryAfterCapLimiter:
+        return _UnboundRetryAfterCap(make(cap, clock, backoff))
+
+    _cap_clamps(unbound)
+    _cap_honours_lower_values(unbound)
+    _cap_spares_backoff_delays(unbound)
 
 
 # ---- kind change --------------------------------------------------------------------

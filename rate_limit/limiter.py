@@ -594,3 +594,11 @@ class BoundLimiter:
 
     def blocked_for(self) -> float:
         return self._limiter.blocked_for(self._limit_id, self._weights)
+
+    def paused_until(self) -> float:
+        return self._limiter.paused_until(self._limit_id)
+
+    def report_throttled(
+        self, retry_after: float | None = None, *, status: int | None = None
+    ) -> RateLimitVerdict:
+        return self._limiter.report_throttled(self._limit_id, retry_after, status=status)

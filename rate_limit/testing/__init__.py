@@ -2,10 +2,14 @@
 
 from rate_limit.testing.clock import BlockingSleep, ManualClock
 from rate_limit.testing.conformance import (
+    BoundRetryAfterCapLimiter,
+    BoundUnpausableLimiter,
     KindChangeLimiter,
     RetryAfterCapLimiter,
     UnpausableLimiter,
     assert_conforms_backoff,
+    assert_conforms_bound_retry_after_cap,
+    assert_conforms_bound_unpausable,
     assert_conforms_kind_change,
     assert_conforms_pausable,
     assert_conforms_rest_limiter,
@@ -17,11 +21,15 @@ from rate_limit.testing.conformance import (
 
 __all__ = [
     "BlockingSleep",
+    "BoundRetryAfterCapLimiter",
+    "BoundUnpausableLimiter",
     "KindChangeLimiter",
     "ManualClock",
     "RetryAfterCapLimiter",
     "UnpausableLimiter",
     "assert_conforms_backoff",
+    "assert_conforms_bound_retry_after_cap",
+    "assert_conforms_bound_unpausable",
     "assert_conforms_kind_change",
     "assert_conforms_pausable",
     "assert_conforms_rest_limiter",

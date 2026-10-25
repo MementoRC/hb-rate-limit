@@ -1085,6 +1085,24 @@ class TestProtocolsAndBinding:
         await bound.acquire()
         assert clock() == pytest.approx(1030.0)
 
+    def test_bound_paused_until(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 5, 1), RateLimit("b", 5, 1))
+        bound = rl.bind("a")
+        assert bound.paused_until() == 0.0
+        bound.pause(50)
+        assert bound.paused_until() == pytest.approx(1050.0)
+        assert rl.paused_until("b") == 0.0
+
+    def test_bound_report_throttled(self, clock: ManualClock) -> None:
+        rl = make(clock, RateLimit("a", 5, 1), RateLimit("b", 5, 1))
+        bound = rl.bind("a")
+        verdict = bound.report_throttled(7.0)
+        assert verdict.retry_after == 7.0
+        assert verdict.delay == pytest.approx(7.0)
+        assert bound.paused_until() == pytest.approx(1007.0)
+        assert not rl.is_paused("b")
+        assert bound.report_throttled(status=503).status == 503
+
     async def test_bound_weights(self, clock: ManualClock) -> None:
         rl = make(clock, RateLimit("a", 10, 1))
         bound = rl.bind("a", {"a": 10})

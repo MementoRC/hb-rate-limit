@@ -14,11 +14,15 @@ from rate_limit import (
     ThrottlerProtocol,
 )
 from rate_limit.testing import (
+    BoundRetryAfterCapLimiter,
+    BoundUnpausableLimiter,
     KindChangeLimiter,
     ManualClock,
     RetryAfterCapLimiter,
     UnpausableLimiter,
     assert_conforms_backoff,
+    assert_conforms_bound_retry_after_cap,
+    assert_conforms_bound_unpausable,
     assert_conforms_kind_change,
     assert_conforms_pausable,
     assert_conforms_rest_limiter,
@@ -87,6 +91,25 @@ def test_retry_after_cap_conformance() -> None:
     assert_conforms_retry_after_cap(make)
 
 
+def test_bound_unpausable_conformance() -> None:
+    def make(limit: RateLimit, clock: Clock, sleep: Sleep) -> BoundUnpausableLimiter:
+        return RateLimiter([limit], clock=clock, sleep=sleep).bind(limit.limit_id)
+
+    assert_conforms_bound_unpausable(make)
+
+
+def test_bound_retry_after_cap_conformance() -> None:
+    def make(
+        cap: float, clock: Clock, backoff_factory: Callable[[], BackoffPolicy]
+    ) -> BoundRetryAfterCapLimiter:
+        limiter = RateLimiter(
+            clock=clock, backoff_factory=backoff_factory, max_retry_after_seconds=cap
+        )
+        return limiter.bind("a")
+
+    assert_conforms_bound_retry_after_cap(make)
+
+
 def test_kind_change_conformance() -> None:
     def make(limits: Sequence[RateLimit], clock: Clock, sleep: Sleep) -> KindChangeLimiter:
         return RateLimiter(limits, clock=clock, sleep=sleep)
@@ -131,6 +154,28 @@ def test_conformance_detects_an_uncapped_limiter() -> None:
 
     with pytest.raises(AssertionError):
         assert_conforms_retry_after_cap(make)
+
+
+def test_conformance_detects_a_bound_limiter_that_ignores_unpause() -> None:
+    class Deaf(RateLimiter):
+        def unpause(self, limit_id: str) -> None:
+            return None
+
+    def make(limit: RateLimit, clock: Clock, sleep: Sleep) -> BoundUnpausableLimiter:
+        return Deaf([limit], clock=clock, sleep=sleep).bind(limit.limit_id)
+
+    with pytest.raises(AssertionError):
+        assert_conforms_bound_unpausable(make)
+
+
+def test_conformance_detects_an_uncapped_bound_limiter() -> None:
+    def make(
+        cap: float, clock: Clock, backoff_factory: Callable[[], BackoffPolicy]
+    ) -> BoundRetryAfterCapLimiter:
+        return RateLimiter(clock=clock, backoff_factory=backoff_factory).bind("a")
+
+    with pytest.raises(AssertionError):
+        assert_conforms_bound_retry_after_cap(make)
 
 
 def test_conformance_detects_a_broken_limiter() -> None:
@@ -201,6 +246,8 @@ def test_plugin_fixtures(manual_clock: ManualClock, conformance_suites: SimpleNa
     assert conformance_suites.token_bucket is assert_conforms_token_bucket
     assert conformance_suites.unpausable is assert_conforms_unpausable
     assert conformance_suites.retry_after_cap is assert_conforms_retry_after_cap
+    assert conformance_suites.bound_unpausable is assert_conforms_bound_unpausable
+    assert conformance_suites.bound_retry_after_cap is assert_conforms_bound_retry_after_cap
     assert conformance_suites.kind_change is assert_conforms_kind_change
 
 

@@ -88,6 +88,11 @@ required protocols; run one only if your limiter claims the feature (each is als
 (driven by `rate_limit.testing.BlockingSleep`), `assert_conforms_retry_after_cap(make)` with
 `make(cap, clock, backoff_factory)`, and `assert_conforms_kind_change(make)` with
 `make(limits, clock, sleep)` (`set_limits` carries usage across a window / token-bucket switch).
+For a limiter bound to one limit id (`limiter.bind("x")`, which also forwards `paused_until()`
+and `report_throttled(retry_after, status=)`), `assert_conforms_bound_unpausable(make)` with
+`make(limit, clock, sleep)` and `assert_conforms_bound_retry_after_cap(make)` with
+`make(cap, clock, backoff_factory)` run the same scenarios; the bound unpausable suite skips the
+`pause_all` and multi-id ones.
 
 ---
 
@@ -99,7 +104,9 @@ opt-in `max_retry_after_seconds` cap, `safety_margin_pct` on `get_pool_limiter`,
 helpers and the conformance kit.
 
 Unreleased: the conformance kit gains opt-in `token_bucket`, `unpausable`, `retry_after_cap` and
-`kind_change` suites (plus `BlockingSleep`), closing the v0.2 kit gap.
+`kind_change` suites (plus `BlockingSleep`), closing the v0.2 kit gap, and bound-limiter
+variants `bound_unpausable` and `bound_retry_after_cap`; `BoundLimiter` gains `paused_until()` and
+`report_throttled()`.
 
 ---
 
