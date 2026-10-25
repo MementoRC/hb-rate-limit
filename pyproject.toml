@@ -101,10 +101,12 @@ source_pkgs = ["rate_limit"]
 omit = ["rate_limit/__about__.py"]
 
 [tool.coverage.report]
-fail_under = 90
+fail_under = 100
 show_missing = true
 skip_covered = true
 exclude_lines = ["no cov", "if __name__", "if TYPE_CHECKING", "raise NotImplementedError", "@overload"]
+# Protocol stubs: a body that is only `...` is a signature, not logic.
+exclude_also = ['^\s*\.\.\.\s*$', ':\s*\.\.\.\s*$']
 
 [tool.hummingbot.supersedes]
 modules = []
