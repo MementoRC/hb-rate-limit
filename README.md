@@ -157,6 +157,23 @@ creates one) and dropped once empty, so memory stays bounded without sweeping ev
 and the cooldowns immediately before sending, so each key's stamp is as close as possible to the
 real send.
 
+### hummingbot compatibility (rate_limit.hb_compat)
+
+`rate_limit.hb_compat` is a drop-in for `hummingbot.core.api_throttler` (`data_types`,
+`async_throttler_base`, `async_request_context_base`, `async_throttler`) running on `RateLimiter`,
+with no core change. It keeps the legacy surface: the mutable `RateLimit`, `_rate_limits` /
+`_id_to_limit_map` / `_raw_limits`, keep-existing `add_rate_limits` (one warning per id), the
+`max(1, floor)` share scaling, and `paused_until()` returning `None` when never paused.
+
+Intentional behaviour changes:
+
+- a weight that can never fit raises `RateLimitWeightError` where legacy hung
+- duplicate linked ids are summed, and the `add_rate_limits` conflict check compares links as a multiset
+- windows use the injected monotonic clock (no `time.time`)
+- a `time_interval` <= 0 (or non-finite) raises `ValueError`
+- no FIFO guarantee among waiters
+- `TaskLog` is import-only
+
 ---
 
 ## Status
