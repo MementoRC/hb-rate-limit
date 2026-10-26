@@ -126,15 +126,17 @@ class AsyncThrottlerBase(ABC):
             core = {item.limit_id: coerce_limit(item) for item in scaled}
             self._limiter.set_limits(core.values())
             self._raw_limits = {limit.limit_id: copy.deepcopy(limit) for limit in rate_limits}
+            self._raw_rate_limits = [copy.deepcopy(limit) for limit in rate_limits]
             self._id_to_limit_map = {item.limit_id: item for item in scaled}
 
     @property
     def _rate_limits(self) -> list[RateLimit]:
         """A fresh copy of the RAW (unscaled) definitions, in registration order.
 
-        Effective (scaled) limits come from ``get_limit`` / ``_id_to_limit_map``.
+        Like legacy, duplicates of one ``limit_id`` are preserved (length and order match what
+        was registered). Effective (scaled) limits come from ``get_limit`` / ``_id_to_limit_map``.
         """
-        return [copy.deepcopy(limit) for limit in self._raw_limits.values()]
+        return [copy.deepcopy(limit) for limit in self._raw_rate_limits]
 
     @_rate_limits.setter
     def _rate_limits(self, rate_limits: list[RateLimit]) -> None:
@@ -161,6 +163,7 @@ class AsyncThrottlerBase(ABC):
             self._limiter.add_limits(core)
             for limit_id, (raw, scaled) in staged.items():
                 self._raw_limits[limit_id] = raw
+                self._raw_rate_limits.append(copy.deepcopy(raw))
                 self._id_to_limit_map[limit_id] = scaled
 
     def _warn_definition_kept(self, existing: RateLimit, rejected: RateLimit) -> None:

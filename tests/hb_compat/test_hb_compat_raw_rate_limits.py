@@ -44,6 +44,42 @@ def definition_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRec
     return [r for r in caplog.records if "different definition" in r.getMessage()]
 
 
+def test_duplicate_limit_id_in_one_set_keeps_length_and_order():
+    throttler = build(50)
+
+    throttler.set_rate_limits(
+        [
+            RateLimit("dup", limit=10, time_interval=INTERVAL),
+            RateLimit("dup", limit=20, time_interval=INTERVAL),
+        ]
+    )
+
+    assert [(item.limit_id, item.limit) for item in throttler._rate_limits] == [
+        ("dup", 10),
+        ("dup", 20),
+    ]
+
+
+def test_legacy_count_parity_at_half_share():
+    originals = [RateLimit(f"id{i}", limit=100 + i, time_interval=INTERVAL) for i in range(5)]
+    throttler = AsyncThrottler(
+        rate_limits=copy.deepcopy(originals),
+        limits_share_percentage=Decimal(50),
+        clock=ManualClock(),
+        sleep=tick,
+    )
+    assert len(throttler._rate_limits) == 5
+
+    throttler.add_rate_limits([RateLimit("extra", limit=7, time_interval=INTERVAL)])
+    assert len(throttler._rate_limits) == 6
+    assert [item.limit for item in throttler._rate_limits][-1] == 7
+
+    throttler.set_rate_limits(copy.deepcopy(originals))
+    assert [(item.limit_id, item.limit) for item in throttler._rate_limits] == [
+        (item.limit_id, item.limit) for item in originals
+    ]
+
+
 def test_bitrue_style_round_trips_do_not_rescale_at_half_share():
     throttler = build(50)
 

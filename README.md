@@ -186,7 +186,8 @@ v0.4.1: INTENTIONAL CONTRACT CHANGE in `hb_compat` (#9): `AsyncThrottler._rate_l
 definitions (the setter, `set_rate_limits` and `add_rate_limits` scale exactly once); effective (scaled) limits
 come from `get_limit` / `_id_to_limit_map`. Fixes double-scaling with the bitrue/derive-style
 `set_rate_limits(deepcopy(_rate_limits))` pattern when `rate_limits_share_pct < 100`, and the spurious
-"different definition" warning it caused. No core change.
+"different definition" warning it caused. `_rate_limits` preserves legacy length and order, duplicates
+included. No core change.
 
 v0.4.0: adds `rate_limit.hb_compat`, the hummingbot `AsyncThrottler` drop-in; no core change.
 
