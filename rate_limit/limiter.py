@@ -35,7 +35,15 @@ from rate_limit.errors import (
     UnknownRateLimitError,
 )
 from rate_limit.pools import Pool, SlidingWindowPool, TokenBucketPool, carry_over, new_pool
-from rate_limit.types import Clock, RateLimit, RateLimitLike, Sleep, check_weight, coerce_limit
+from rate_limit.types import (
+    Clock,
+    RateLimit,
+    RateLimitLike,
+    Sleep,
+    check_pool_weight,
+    check_weight,
+    coerce_limit,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -236,10 +244,33 @@ class RateLimiter:
             self._unknown_warned.add(limit_id)
             notes.append(f"{detail}: unknown rate limit {limit_id!r}; running unthrottled")
 
+    @staticmethod
+    def _check_pools(
+        limit_id: str, weights: Mapping[str, int] | None, pools: Mapping[str, int] | None
+    ) -> None:
+        for key, value in (pools or {}).items():
+            if key == limit_id:
+                raise ValueError(
+                    f"pools key {key!r} is the primary; charge it via weights or its "
+                    "declared weight"
+                )
+            if key in (weights or {}):
+                raise ValueError(f"{key!r} is in both weights and pools: ambiguous")
+            check_pool_weight(value, f"pools[{key!r}]")
+
     def _plan(
-        self, limit_id: str, weights: Mapping[str, int] | None, notes: list[str]
+        self,
+        limit_id: str,
+        weights: Mapping[str, int] | None,
+        notes: list[str],
+        pools: Mapping[str, int] | None = None,
     ) -> list[tuple[str, int]] | None:
-        """Resolve the charges for one call (lock held). ``None`` = run unthrottled."""
+        """Resolve the charges for one call (lock held). ``None`` = run unthrottled.
+
+        ``pools`` sets the cost of a pool for this call only: for a linked id it replaces the
+        declared total, otherwise it adds a charge. A cost of 0 drops the pool from the plan.
+        """
+        self._check_pools(limit_id, weights, pools)
         primary = self._scaled.get(limit_id)
         declared = {limit_id}
         if primary is not None:
@@ -262,6 +293,12 @@ class RateLimiter:
         for key, value in (weights or {}).items():
             if key in charges:
                 charges[key] = value
+        for key, value in (pools or {}).items():
+            if key in self._scaled:
+                charges[key] = value
+            else:
+                self._unknown(key, f"acquire {limit_id!r} (pool)", notes)
+        charges = {charge_id: cost for charge_id, cost in charges.items() if cost}
         for charge_id, cost in charges.items():
             capacity = self._scaled[charge_id].limit
             if cost > capacity:
@@ -270,12 +307,18 @@ class RateLimiter:
                 )
         return list(charges.items())
 
-    def _validate(self, limit_id: str, weights: Mapping[str, int] | None) -> bool:
+    def _validate(
+        self,
+        limit_id: str,
+        weights: Mapping[str, int] | None,
+        *,
+        pools: Mapping[str, int] | None = None,
+    ) -> bool:
         """Raise on a bad call; return False when the call runs unthrottled."""
         notes: list[str] = []
         try:
             with self._lock:
-                return self._plan(limit_id, weights, notes) is not None
+                return self._plan(limit_id, weights, notes, pools) is not None
         finally:
             for message in notes:
                 logger.warning(message)
@@ -309,7 +352,13 @@ class RateLimiter:
         return messages
 
     def _try_reserve(
-        self, limit_id: str, weights: Mapping[str, int] | None, deadline: float, record: bool
+        self,
+        limit_id: str,
+        weights: Mapping[str, int] | None,
+        deadline: float,
+        record: bool,
+        *,
+        pools: Mapping[str, int] | None = None,
     ) -> tuple[float, float, bool, Charge | None]:
         """One synchronous pause-check-and-record step; never awaits.
 
@@ -322,8 +371,9 @@ class RateLimiter:
         try:
             with self._lock:
                 now = self._clock()
-                plan = self._plan(limit_id, weights, warnings)
-                pause_wait = max(0.0, self._paused_until_locked(limit_id) - now)
+                plan = self._plan(limit_id, weights, warnings, pools)
+                charged = [charge_id for charge_id, _ in plan or ()]
+                pause_wait = max(0.0, self._paused_until_locked(limit_id, charged) - now)
                 if record and pause_wait > 0.0:
                     return pause_wait, now, True, None
                 window_wait = 0.0
@@ -347,24 +397,43 @@ class RateLimiter:
 
     # ---- acquire --------------------------------------------------------------------
 
-    async def acquire(self, limit_id: str, weights: Mapping[str, int] | None = None) -> None:
+    async def acquire(
+        self,
+        limit_id: str,
+        weights: Mapping[str, int] | None = None,
+        *,
+        pools: Mapping[str, int] | None = None,
+    ) -> None:
         """Wait out pauses and the window, then record the charge.
 
         :meth:`reserve` without the receipt: sleeps happen outside every lock, cancelling
         records nothing, and an unpause ends a sleep spent in a pause early.
         """
-        await self.reserve(limit_id, weights)
+        await self.reserve(limit_id, weights, pools=pools)
 
-    async def reserve(self, limit_id: str, weights: Mapping[str, int] | None = None) -> Charge:
+    async def reserve(
+        self,
+        limit_id: str,
+        weights: Mapping[str, int] | None = None,
+        *,
+        pools: Mapping[str, int] | None = None,
+    ) -> Charge:
         """Wait out pauses and the window, record the charge, and return its :class:`Charge`.
 
         Sleeps happen outside every lock; cancelling records nothing. A sleep spent in a pause
         ends early when :meth:`unpause` / :meth:`unpause_all` lifts it, and the call re-assesses.
         An unknown id in "allow" mode returns an empty charge, whose refund is a no-op.
+
+        ``pools`` (``{pool_id: cost}``, cost >= 0) sets the cost of registered pools for this
+        call only, atomically with the rest: a linked pool's cost is replaced (0 skips it), an
+        unlinked pool is added. The primary can't be named (use ``weights``), nor a ``weights``
+        key; nothing is registered.
         """
         deadline = -math.inf
         while True:
-            wait, now, paused, charge = self._try_reserve(limit_id, weights, deadline, record=True)
+            wait, now, paused, charge = self._try_reserve(
+                limit_id, weights, deadline, record=True, pools=pools
+            )
             if charge is not None:
                 return charge
             if paused:
@@ -413,6 +482,7 @@ class RateLimiter:
         limit_id: str,
         *,
         weights: Mapping[str, int] | None = None,
+        pools: Mapping[str, int] | None = None,
         refund_on_error: bool = False,
     ) -> AbstractAsyncContextManager[None]:
         """Async context manager that reserves on entry; exit is a no-op by default.
@@ -424,20 +494,38 @@ class RateLimiter:
         timeout, a parse error) means the venue already counted it, so a refund under-throttles;
         there, use :meth:`reserve` and refund explicitly.
         """
-        self._validate(limit_id, weights)
-        return _TaskContext(self, limit_id, weights, refund_on_error)
+        self._validate(limit_id, weights, pools=pools)
+        return _TaskContext(self, limit_id, weights, refund_on_error, pools)
 
-    def try_acquire(self, limit_id: str, weights: Mapping[str, int] | None = None) -> float:
+    def try_acquire(
+        self,
+        limit_id: str,
+        weights: Mapping[str, int] | None = None,
+        *,
+        pools: Mapping[str, int] | None = None,
+    ) -> float:
         """Non-blocking: 0.0 = reserved, else seconds to wait (nothing recorded)."""
-        return self._try_reserve(limit_id, weights, -math.inf, record=True)[0]
+        return self._try_reserve(limit_id, weights, -math.inf, record=True, pools=pools)[0]
 
-    def blocked_for(self, limit_id: str, weights: Mapping[str, int] | None = None) -> float:
+    def blocked_for(
+        self,
+        limit_id: str,
+        weights: Mapping[str, int] | None = None,
+        *,
+        pools: Mapping[str, int] | None = None,
+    ) -> float:
         """Seconds until an acquire would pass (pause or window); records nothing."""
-        return self._try_reserve(limit_id, weights, -math.inf, record=False)[0]
+        return self._try_reserve(limit_id, weights, -math.inf, record=False, pools=pools)[0]
 
-    def bind(self, limit_id: str, weights: Mapping[str, int] | None = None) -> BoundLimiter:
+    def bind(
+        self,
+        limit_id: str,
+        weights: Mapping[str, int] | None = None,
+        *,
+        pools: Mapping[str, int] | None = None,
+    ) -> BoundLimiter:
         """A single-limit view satisfying the pausable limiter protocols."""
-        return BoundLimiter(self, limit_id, weights)
+        return BoundLimiter(self, limit_id, weights, pools=pools)
 
     # ---- pause + backoff ------------------------------------------------------------
 
@@ -495,8 +583,8 @@ class RateLimiter:
                 state.deadline = 0.0
         self._wake_sleepers()
 
-    def _paused_until_locked(self, limit_id: str) -> float:
-        ids = {limit_id}
+    def _paused_until_locked(self, limit_id: str, extra_ids: Iterable[str] = ()) -> float:
+        ids = {limit_id, *extra_ids}
         primary = self._scaled.get(limit_id)
         if primary is not None:
             ids.update(pair.limit_id for pair in primary.linked_limits)
@@ -658,15 +746,17 @@ class _TaskContext:
         limit_id: str,
         weights: Mapping[str, int] | None,
         refund_on_error: bool,
+        pools: Mapping[str, int] | None = None,
     ) -> None:
         self._limiter = limiter
         self._limit_id = limit_id
         self._weights = weights
+        self._pools = pools
         self._refund_on_error = refund_on_error
         self._charge: Charge | None = None
 
     async def __aenter__(self) -> None:
-        self._charge = await self._limiter.reserve(self._limit_id, self._weights)
+        self._charge = await self._limiter.reserve(self._limit_id, self._weights, pools=self._pools)
 
     async def __aexit__(
         self,
@@ -683,11 +773,17 @@ class BoundLimiter:
     """One limit id of a :class:`RateLimiter` (``acquire()/pause(s)/is_paused()/backoff``)."""
 
     def __init__(
-        self, limiter: RateLimiter, limit_id: str, weights: Mapping[str, int] | None = None
+        self,
+        limiter: RateLimiter,
+        limit_id: str,
+        weights: Mapping[str, int] | None = None,
+        *,
+        pools: Mapping[str, int] | None = None,
     ) -> None:
         self._limiter = limiter
         self._limit_id = limit_id
         self._weights = weights
+        self._pools = pools
 
     @property
     def limiter(self) -> RateLimiter:
@@ -702,10 +798,10 @@ class BoundLimiter:
         return self._limiter.backoff(self._limit_id)
 
     async def acquire(self) -> None:
-        await self._limiter.acquire(self._limit_id, self._weights)
+        await self._limiter.acquire(self._limit_id, self._weights, pools=self._pools)
 
     async def reserve(self) -> Charge:
-        return await self._limiter.reserve(self._limit_id, self._weights)
+        return await self._limiter.reserve(self._limit_id, self._weights, pools=self._pools)
 
     def pause(self, seconds: float) -> None:
         self._limiter.pause(self._limit_id, seconds)
@@ -720,7 +816,7 @@ class BoundLimiter:
         return self._limiter.is_paused(self._limit_id)
 
     def blocked_for(self) -> float:
-        return self._limiter.blocked_for(self._limit_id, self._weights)
+        return self._limiter.blocked_for(self._limit_id, self._weights, pools=self._pools)
 
     def paused_until(self) -> float:
         return self._limiter.paused_until(self._limit_id)
