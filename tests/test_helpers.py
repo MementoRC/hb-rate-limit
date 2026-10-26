@@ -239,6 +239,37 @@ class TestUnpausableLimiter:
                 note_rate_limited(limiter, RateLimitExceededError(status=429))
         assert len([r for r in caplog.records if "cannot pause" in r.getMessage()]) == 1
 
+    def test_stale_id_entry_does_not_suppress_warning(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class Slotted:
+            __slots__ = ()
+
+            async def acquire(self) -> None:
+                return None
+
+        limiter = Slotted()
+        # A dead limiter's id was reused by this one: the entry maps to a different object.
+        monkeypatch.setitem(helpers._UNPAUSABLE_WARNED_IDS, id(limiter), object())
+        with caplog.at_level(logging.WARNING):
+            note_rate_limited(limiter, RateLimitExceededError(status=429))  # type: ignore[arg-type]
+            note_rate_limited(limiter, RateLimitExceededError(status=429))  # type: ignore[arg-type]
+        assert len([r for r in caplog.records if "cannot pause" in r.getMessage()]) == 1
+
+    def test_unpausable_registry_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class Slotted:
+            __slots__ = ()
+
+            async def acquire(self) -> None:
+                return None
+
+        monkeypatch.setattr(helpers, "_UNPAUSABLE_WARNED_IDS_MAX", 2)
+        limiters = [Slotted() for _ in range(3)]
+        for limiter in limiters:
+            note_rate_limited(limiter, RateLimitExceededError(status=429))  # type: ignore[arg-type]
+        assert len(helpers._UNPAUSABLE_WARNED_IDS) == 2
+        assert id(limiters[0]) not in helpers._UNPAUSABLE_WARNED_IDS
+
     def test_limiter_label_falls_back_to_type_name(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.WARNING):
             note_rate_limited(self.AcquireOnly(), RateLimitExceededError(status=418))  # type: ignore[arg-type]
