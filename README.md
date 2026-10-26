@@ -109,6 +109,18 @@ await send(signed)
 
 `limiter.bind("klines").reserve()` does the same with the bound weights.
 
+### Per-call `pools`
+
+`pools={pool_id: cost}` (cost >= 0) sets what a registered pool is charged for one call. For a pool
+linked to the primary it replaces the declared total, and `0` skips it. A pool not linked to the
+primary is charged in the same atomic reserve, and nothing is registered. The primary itself is
+charged via `weights`; a key in both `weights` and `pools` raises `ValueError`.
+
+```python
+await limiter.acquire("klines", pools={"REQUEST_WEIGHT": 0})  # skip the linked pool this call
+await limiter.acquire("klines", pools={"orders": 1, "ip": 2})  # also charge two unlinked pools
+```
+
 Share one budget across instances with `get_pool_limiter(pool_key, limit)`; the kind and
 `safety_margin_pct` (default 0.0; hb_compat shims pass 0.05) are part of the pool's identity.
 The `run_paced` / `note_rate_limited` helpers take an optional `clock=` for limiters that can
@@ -181,6 +193,12 @@ Intentional behaviour changes:
 ---
 
 ## Status
+
+v0.5.0: additive per-call keyword `pools={pool_id: cost}` (cost >= 0) on `RateLimiter.reserve` / `acquire` /
+`try_acquire` / `blocked_for` / `execute_task` / `bind` and `BoundLimiter`. A cost of 0 skips a linked pool for
+that call (#11); a registered pool NOT linked to the primary is charged ad hoc, atomically, for that call only,
+registering nothing (#12). The primary stays charged via `weights` (>= 1); calls without `pools` behave exactly as
+before, and `hb_compat` is unchanged.
 
 v0.4.1: INTENTIONAL CONTRACT CHANGE in `hb_compat` (#9): `AsyncThrottler._rate_limits` now reads and accepts RAW
 definitions (the setter, `set_rate_limits` and `add_rate_limits` scale exactly once); effective (scaled) limits

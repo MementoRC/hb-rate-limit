@@ -24,6 +24,13 @@ def check_weight(value: object, what: str = "weight") -> int:
     return _check_int_ge1(value, what)
 
 
+def check_pool_weight(value: object, what: str = "pool weight") -> int:
+    """Validate a per-call pool charge: an int >= 0 (bool is rejected); 0 skips the pool."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{what} must be an int >= 0, got {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class LinkedLimitWeightPair:
     """A linked pool and the weight charged to it."""
