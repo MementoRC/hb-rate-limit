@@ -118,21 +118,23 @@ class AsyncThrottlerBase(ABC):
         return scaled
 
     def set_rate_limits(self, rate_limits: list[RateLimit]) -> None:
-        """Replace the active set; the limits are deep-copied and scaled by ``limits_pct``."""
+        """Replace the active set; input is RAW, deep-copied and scaled once by ``limits_pct``."""
         with self._mirror_lock:
             for limit in rate_limits:
                 _check_interval(limit)
             scaled = [self._scale(limit) for limit in rate_limits]
             core = {item.limit_id: coerce_limit(item) for item in scaled}
             self._limiter.set_limits(core.values())
-            self._scaled_rate_limits = scaled
             self._raw_limits = {limit.limit_id: copy.deepcopy(limit) for limit in rate_limits}
             self._id_to_limit_map = {item.limit_id: item for item in scaled}
 
     @property
     def _rate_limits(self) -> list[RateLimit]:
-        """The live list of scaled limits."""
-        return self._scaled_rate_limits
+        """A fresh copy of the RAW (unscaled) definitions, in registration order.
+
+        Effective (scaled) limits come from ``get_limit`` / ``_id_to_limit_map``.
+        """
+        return [copy.deepcopy(limit) for limit in self._raw_limits.values()]
 
     @_rate_limits.setter
     def _rate_limits(self, rate_limits: list[RateLimit]) -> None:
@@ -159,7 +161,6 @@ class AsyncThrottlerBase(ABC):
             self._limiter.add_limits(core)
             for limit_id, (raw, scaled) in staged.items():
                 self._raw_limits[limit_id] = raw
-                self._scaled_rate_limits.append(scaled)
                 self._id_to_limit_map[limit_id] = scaled
 
     def _warn_definition_kept(self, existing: RateLimit, rejected: RateLimit) -> None:
