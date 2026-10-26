@@ -112,7 +112,8 @@ def test_rate_limits_assignment_rebuilds_id_to_limit_map():
     assert list(throttler._id_to_limit_map) == ["new"]
     assert [limit.limit_id for limit in throttler._rate_limits] == ["new"]
     assert throttler._id_to_limit_map["new"].limit == 5
-    assert throttler._id_to_limit_map["new"] is throttler._rate_limits[0]
+    assert throttler._rate_limits[0].limit == 10
+    assert throttler._id_to_limit_map["new"] is not throttler._rate_limits[0]
 
 
 def test_direct_rate_limits_assignment_scales_once_and_leaves_source_untouched():
@@ -135,7 +136,7 @@ def test_direct_rate_limits_assignment_scales_once_and_leaves_source_untouched()
     assert throttler.get_limit("B").limit == 5
     assert set(throttler._id_to_limit_map) == {"A", "B"}
     for stored in throttler._rate_limits:
-        assert throttler._id_to_limit_map[stored.limit_id] is stored
+        assert throttler._id_to_limit_map[stored.limit_id] is not stored
         assert all(stored is not source for source in tier_limits)
 
     for source, before in zip(tier_limits, snapshot, strict=True):
@@ -146,10 +147,10 @@ def test_direct_rate_limits_assignment_scales_once_and_leaves_source_untouched()
         assert source.linked_limits == before.linked_limits
 
 
-def test_rate_limits_getter_returns_live_list_and_deepcopy_works():
+def test_rate_limits_getter_returns_fresh_raw_copies_and_deepcopy_works():
     throttler = AsyncThrottler(rate_limits=[RateLimit("a", limit=3, time_interval=1.0)])
 
-    assert throttler._rate_limits is throttler._rate_limits
+    assert throttler._rate_limits is not throttler._rate_limits
     throttler.add_rate_limits([RateLimit("b", limit=2, time_interval=1.0)])
     assert [limit.limit_id for limit in throttler._rate_limits] == ["a", "b"]
 

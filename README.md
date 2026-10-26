@@ -176,11 +176,18 @@ Intentional behaviour changes:
 - a linked limit id that isn't registered is warned once per id by the engine (legacy dropped it silently); it still runs unthrottled for that link
 - `limit_id` must be a non-empty str and weight / linked weight ints >= 1, or `set_rate_limits` / `add_rate_limits` / the constructor raise `ValueError` (legacy accepted anything; no parent definition violates this)
 - the exposed `_rate_limits` list and `get_limit()` objects are views: mutating them in place has no effect on throttling; replace them via `set_rate_limits`, `_rate_limits = [...]` or `add_rate_limits`
-- legacy parity caveat: `_rate_limits` holds SCALED limits, so `set_rate_limits(copy.deepcopy(t._rate_limits))` scales again when `limits_share_percentage < 100` (inherited legacy behaviour, unchanged)
+- (v0.4.1) `_rate_limits` reads and accepts RAW definitions (a fresh deep copy per read); effective scaled limits come from `get_limit` / `_id_to_limit_map`, so `set_rate_limits(copy.deepcopy(t._rate_limits))` no longer scales twice
 
 ---
 
 ## Status
+
+v0.4.1: INTENTIONAL CONTRACT CHANGE in `hb_compat` (#9): `AsyncThrottler._rate_limits` now reads and accepts RAW
+definitions (the setter, `set_rate_limits` and `add_rate_limits` scale exactly once); effective (scaled) limits
+come from `get_limit` / `_id_to_limit_map`. Fixes double-scaling with the bitrue/derive-style
+`set_rate_limits(deepcopy(_rate_limits))` pattern when `rate_limits_share_pct < 100`, and the spurious
+"different definition" warning it caused. `_rate_limits` preserves legacy length and order, duplicates
+included. No core change.
 
 v0.4.0: adds `rate_limit.hb_compat`, the hummingbot `AsyncThrottler` drop-in; no core change.
 

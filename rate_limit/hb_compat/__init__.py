@@ -21,9 +21,9 @@ Intentional behaviour changes from legacy:
 * the exposed ``_rate_limits`` list and ``get_limit()`` objects are views: mutating them in
   place has no effect on throttling; replace them via ``set_rate_limits``,
   ``_rate_limits = [...]`` or ``add_rate_limits``
-* legacy parity caveat: ``_rate_limits`` holds SCALED limits, so
-  ``set_rate_limits(copy.deepcopy(t._rate_limits))`` scales again when
-  ``limits_share_percentage < 100`` (inherited legacy behaviour, unchanged)
+* (v0.4.1) ``_rate_limits`` reads and accepts RAW definitions (a fresh deep copy per read);
+  effective scaled limits come from ``get_limit`` / ``_id_to_limit_map``. So
+  ``set_rate_limits(copy.deepcopy(t._rate_limits))`` no longer scales twice
 """
 
 from rate_limit.hb_compat.async_request_context_base import (
