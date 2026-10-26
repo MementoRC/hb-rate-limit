@@ -37,7 +37,11 @@ __all__ = [
 
 _FALLBACK_POLICIES: weakref.WeakKeyDictionary[Any, BackoffPolicy] = weakref.WeakKeyDictionary()
 _UNPAUSABLE_WARNED: weakref.WeakSet[Any] = weakref.WeakSet()
-_UNPAUSABLE_WARNED_IDS: set[int] = set()  # limiters that cannot be weak-referenced
+# Limiters that cannot be weak-referenced: id -> the limiter itself. The strong reference
+# keeps the id from being reused while the entry exists. Trade-off: up to 256 such limiters
+# are held alive, and the 257th distinct one evicts the oldest, which may then warn again.
+_UNPAUSABLE_WARNED_IDS: dict[int, Any] = {}
+_UNPAUSABLE_WARNED_IDS_MAX = 256
 # Pause deadlines the helper set itself, for limiters that have pause() but no is_paused().
 _OWN_PAUSE_DEADLINES: weakref.WeakKeyDictionary[Any, float] = weakref.WeakKeyDictionary()
 _CLOCK: Callable[[], float] = time.monotonic
@@ -55,15 +59,23 @@ def _backoff_for(limiter: Any) -> BackoffPolicy:
 
 
 def _first_unpausable_warning(limiter: Any) -> bool:
-    """True the first time ``limiter`` is seen; non-weak-referenceable ones are keyed by id."""
+    """True the first time ``limiter`` is seen.
+
+    Non-weak-referenceable limiters are tracked by identity in a bounded registry that
+    holds them alive; an entry for the same id but a different object is stale.
+    """
     try:
         if limiter in _UNPAUSABLE_WARNED:
             return False
         _UNPAUSABLE_WARNED.add(limiter)
     except TypeError:
-        if id(limiter) in _UNPAUSABLE_WARNED_IDS:
+        key = id(limiter)
+        if _UNPAUSABLE_WARNED_IDS.get(key) is limiter:
             return False
-        _UNPAUSABLE_WARNED_IDS.add(id(limiter))
+        _UNPAUSABLE_WARNED_IDS.pop(key, None)
+        _UNPAUSABLE_WARNED_IDS[key] = limiter
+        if len(_UNPAUSABLE_WARNED_IDS) > _UNPAUSABLE_WARNED_IDS_MAX:
+            del _UNPAUSABLE_WARNED_IDS[next(iter(_UNPAUSABLE_WARNED_IDS))]
     return True
 
 

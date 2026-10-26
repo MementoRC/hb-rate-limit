@@ -157,9 +157,32 @@ creates one) and dropped once empty, so memory stays bounded without sweeping ev
 and the cooldowns immediately before sending, so each key's stamp is as close as possible to the
 real send.
 
+### hummingbot compatibility (rate_limit.hb_compat)
+
+`rate_limit.hb_compat` is a drop-in for `hummingbot.core.api_throttler` (`data_types`,
+`async_throttler_base`, `async_request_context_base`, `async_throttler`) running on `RateLimiter`,
+with no core change. It keeps the legacy surface: the mutable `RateLimit`, `_rate_limits` /
+`_id_to_limit_map` / `_raw_limits`, keep-existing `add_rate_limits` (one warning per id), the
+`max(1, floor)` share scaling, and `paused_until()` returning `None` when never paused.
+
+Intentional behaviour changes:
+
+- a weight that can never fit raises `RateLimitWeightError` where legacy hung
+- duplicate linked ids are summed, and the `add_rate_limits` conflict check compares links as a multiset
+- windows use the injected monotonic clock (no `time.time`)
+- a `time_interval` <= 0 (or non-finite) raises `ValueError`
+- no FIFO guarantee among waiters
+- `TaskLog` is import-only
+- a linked limit id that isn't registered is warned once per id by the engine (legacy dropped it silently); it still runs unthrottled for that link
+- `limit_id` must be a non-empty str and weight / linked weight ints >= 1, or `set_rate_limits` / `add_rate_limits` / the constructor raise `ValueError` (legacy accepted anything; no parent definition violates this)
+- the exposed `_rate_limits` list and `get_limit()` objects are views: mutating them in place has no effect on throttling; replace them via `set_rate_limits`, `_rate_limits = [...]` or `add_rate_limits`
+- legacy parity caveat: `_rate_limits` holds SCALED limits, so `set_rate_limits(copy.deepcopy(t._rate_limits))` scales again when `limits_share_percentage < 100` (inherited legacy behaviour, unchanged)
+
 ---
 
 ## Status
+
+v0.4.0: adds `rate_limit.hb_compat`, the hummingbot `AsyncThrottler` drop-in; no core change.
 
 v0.3.0: ships `py.typed`; refund receipts, where `RateLimiter.reserve()` / `BoundLimiter.reserve()`
 return a `Charge` with `refund()`, plus `execute_task(..., refund_on_error=True)` and an opt-in
