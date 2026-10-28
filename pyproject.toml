@@ -63,7 +63,7 @@ format-check = "ruff format --check rate_limit tests"
 typecheck = "mypy rate_limit"
 build = "hatchling build"
 coverage = "pytest tests/ --cov=rate_limit --cov-report=term-missing"
-quality = { depends-on = ["lint", "format-check"] }
+quality = { depends-on = ["lint", "format-check", "typecheck"] }
 check = { depends-on = ["quality", "typecheck", "coverage"] }
 
 [tool.pytest.ini_options]
