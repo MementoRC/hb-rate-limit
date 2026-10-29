@@ -1,0 +1,5 @@
+# CODEOWNERS file for hb-rate-limit
+# Users mentioned here are automatically requested for review.
+
+# Default owners for everything in the repo
+* @MementoRC
