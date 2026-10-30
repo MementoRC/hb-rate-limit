@@ -63,8 +63,9 @@ format-check = "ruff format --check rate_limit tests"
 typecheck = "mypy rate_limit"
 build = "hatchling build"
 coverage = "pytest tests/ --cov=rate_limit --cov-report=term-missing"
-quality = { depends-on = ["lint", "format-check", "typecheck"] }
-check = { depends-on = ["quality", "typecheck", "coverage"] }
+check-conda-first = "python scripts/check_conda_first.py"
+quality = { depends-on = ["check-conda-first", "lint", "format-check", "typecheck"] }
+check = { depends-on = ["check-conda-first", "quality", "typecheck", "coverage"] }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
