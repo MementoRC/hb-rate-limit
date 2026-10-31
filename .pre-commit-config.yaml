@@ -1,10 +1,22 @@
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.2
+  - repo: local
     hooks:
       - id: ruff
-        args: [--fix]
+        name: ruff (pixi)
+        entry: pixi run ruff check --force-exclude --fix
+        language: system
+        types_or: [python, pyi]
       - id: ruff-format
+        name: ruff format (pixi)
+        entry: pixi run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+      - id: mypy
+        name: mypy (pixi typecheck)
+        entry: pixi run typecheck
+        language: system
+        types: [python]
+        pass_filenames: false
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -18,15 +30,6 @@ repos:
       - id: check-docstring-first
       - id: check-merge-conflict
       - id: check-toml
-
-  - repo: local
-    hooks:
-      - id: mypy
-        name: mypy (pixi typecheck)
-        entry: pixi run typecheck
-        language: system
-        types: [python]
-        pass_filenames: false
 
   - repo: https://github.com/Yelp/detect-secrets
     rev: v1.5.0
