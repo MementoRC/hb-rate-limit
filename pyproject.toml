@@ -112,5 +112,7 @@ exclude_lines = ["no cov", "if __name__", "if TYPE_CHECKING", "raise NotImplemen
 exclude_also = ['^\s*\.\.\.\s*$', ':\s*\.\.\.\s*$']
 
 [tool.hummingbot.supersedes]
-modules = []
-test_paths = []
+modules = ["api_throttler"]
+test_paths = [
+    "test/hummingbot/core/api_throttler/test_async_throttler.py",
+]
