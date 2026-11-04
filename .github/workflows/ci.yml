@@ -5,6 +5,8 @@ on:
     branches: [main, development]
   pull_request:
     branches: [main, development]
+  # Lets pixi-lock-refresh.yml start CI on its bot branch (github.token can't trigger push/PR runs)
+  workflow_dispatch:
 
 # Cancel in-progress CI runs for the same ref/branch
 concurrency:
@@ -16,7 +18,7 @@ permissions: {}
 
 jobs:
   ci:
-    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-ci.yml@8f6fe6495de08228f74fa51f92070b131911d268 # v4.0.0
+    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-ci.yml@2e45ef2ffe9211214d5fefa67d5036d3ac780a13 # v4.1.0
     permissions:
       contents: write
       id-token: write
@@ -34,6 +36,7 @@ jobs:
       editable-install: true
       package-path: "."
       allowed-licenses: "MIT, Apache-2.0, BSD-3-Clause, BSD-2-Clause, ISC, PSF-2.0, LGPL-3.0"
+      pip-policy-check: "enforce"
 
   branch-policy:
     name: "Branch Policy"

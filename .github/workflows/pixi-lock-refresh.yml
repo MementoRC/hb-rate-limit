@@ -1,0 +1,24 @@
+# Pixi Lock Refresh - CI Framework (zero-secret; ci-framework #387)
+# Refreshes pixi.lock weekly and opens (or updates) a GitHub-signed bot PR using only github.token.
+# Prerequisites: ci.yml declares `workflow_dispatch:`, and the repo allows
+# GitHub Actions to create and approve pull requests.
+
+name: Pixi Lock Refresh
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+# Deny all permissions by default; the job requests only what it needs.
+permissions: {}
+
+jobs:
+  refresh:
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-pixi-lock-refresh.yml@2e45ef2ffe9211214d5fefa67d5036d3ac780a13 # v4.1.0
+    with:
+      target-branch: development
