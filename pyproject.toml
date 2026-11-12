@@ -30,11 +30,13 @@ pytest-cov = ">=7.1.0"
 pytest-timeout = ">=2.4.0"
 ruff = "=0.17.2"
 mypy = ">=1.20.0"
+import-linter = ">=2.0"
 pre-commit = ">=2.15.0"
 
 [tool.pixi.feature.ci.dependencies]
 ruff = "=0.17.2"
 mypy = ">=1.20.0"
+import-linter = ">=2.0"
 pytest = ">=9.0.3"
 pytest-cov = ">=7.1.0"
 pytest-timeout = ">=2.4.0"
@@ -64,7 +66,8 @@ typecheck = "mypy rate_limit"
 build = "hatchling build"
 coverage = "pytest tests/ --cov=rate_limit --cov-report=term-missing"
 check-conda-first = "python scripts/check_conda_first.py"
-quality = { depends-on = ["check-conda-first", "lint", "format-check", "typecheck"] }
+lint-boundaries = "lint-imports"
+quality = { depends-on = ["check-conda-first", "lint", "format-check", "typecheck", "lint-boundaries"] }
 check = { depends-on = ["check-conda-first", "quality", "typecheck", "coverage"] }
 
 [tool.pytest.ini_options]
@@ -110,6 +113,22 @@ skip_covered = true
 exclude_lines = ["no cov", "if __name__", "if TYPE_CHECKING", "raise NotImplementedError", "@overload"]
 # Protocol stubs: a body that is only `...` is a signature, not logic.
 exclude_also = ['^\s*\.\.\.\s*$', ':\s*\.\.\.\s*$']
+
+[tool.importlinter]
+root_package = "rate_limit"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "rate_limit never imports hummingbot (ADR 0001)"
+type = "forbidden"
+source_modules = ["rate_limit"]
+forbidden_modules = ["hummingbot"]
+
+[[tool.importlinter.contracts]]
+name = "adr-0001-l0-leaf-independence"
+type = "forbidden"
+source_modules = ["rate_limit"]
+forbidden_modules = ["data_type_primitives", "event_bus", "logger", "async_utils", "connector_utils", "candles_feed", "liquidations_feed", "rate_oracle", "market_data", "market_connector", "market_simulator", "web_assistant", "remote_iface", "strategy_framework", "order_book", "user_stream_tracker"]
 
 [tool.hummingbot.supersedes]
 modules = ["api_throttler"]
