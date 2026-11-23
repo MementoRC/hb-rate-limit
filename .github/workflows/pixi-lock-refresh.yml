@@ -18,7 +18,7 @@ jobs:
   refresh:
     permissions:
       contents: read
-    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-pixi-lock-refresh.yml@0ca97504ab812f21c3ae45411423f8675f8188e6 # v4.4.1
+    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-pixi-lock-refresh.yml@f58ca6cbdc509968ea5f60d559caf86bc2d435fe # v5.0.0
     with:
       target-branch: development
       auto-merge: true
