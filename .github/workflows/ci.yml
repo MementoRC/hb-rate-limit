@@ -18,14 +18,12 @@ permissions: {}
 
 jobs:
   ci:
-    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-ci.yml@f58ca6cbdc509968ea5f60d559caf86bc2d435fe # v5.0.0
+    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-ci.yml@00e1705d5c63d4226920823a2f9184e99416aa09 # v5.1.0
     permissions:
-      contents: write
-      id-token: write
-      pull-requests: write
+      contents: read
       actions: read
-      checks: write
       security-events: write
+      id-token: write
     secrets: inherit
     with:
       codeql: true
