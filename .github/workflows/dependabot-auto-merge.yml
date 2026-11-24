@@ -10,7 +10,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-dependabot-auto-merge.yml@0ca97504ab812f21c3ae45411423f8675f8188e6 # v4.4.1
+    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-dependabot-auto-merge.yml@00e1705d5c63d4226920823a2f9184e99416aa09 # v5.1.0
     secrets:
       APP_CLIENT_ID: ${{ secrets.APP_CLIENT_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
