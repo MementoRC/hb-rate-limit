@@ -1,0 +1,35 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Import GPG key and configure Git
+        env:
+          CI_BOT_GPG_KEY: ${{ secrets.CI_BOT_GPG_KEY }}
+          CI_BOT_GPG_KEY_ID: ${{ secrets.CI_BOT_GPG_KEY_ID }}
+        run: |
+          if [ -n "$CI_BOT_GPG_KEY" ]; then
+            echo "$CI_BOT_GPG_KEY" | gpg --batch --import
+            git config --global user.name "CIFrameworkBot"
+            git config --global user.email "223036950+CIFrameworkBot@users.noreply.github.com"
+            git config --global user.signingkey "$CI_BOT_GPG_KEY_ID"
+            git config --global commit.gpgsign true
+          fi
+
+      - name: Release Please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
+        with:
+          token: ${{ secrets.CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
