@@ -1,0 +1,62 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    # The repo default token is read-only. release-please needs write access to
+    # push the release branch/tag (contents), open the release PR (pull-requests)
+    # and create its "autorelease: *" labels (issues). actions: write lets it
+    # dispatch CI on the release branch (see the last step).
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      # Release commits are created through the GitHub API and signed by
+      # GitHub (web-flow), so no GPG setup or extra secret is needed.
+      - name: Release Please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Release PRs always target development, whatever the repo's
+          # default branch is; development reaches main by the usual promote PR.
+          target-branch: development
+          # No release-type input: setting it makes the action ignore the
+          # config file (extra-files, changelog-sections, pre-major bumps).
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # A PR opened or updated with github.token starts no push/pull_request
+      # workflows, so the required checks from ci.yml would never report.
+      # workflow_dispatch is the documented exception: dispatch CI on the
+      # release branch so the checks land on its head commit. outputs.pr is
+      # set whenever a release PR was created OR updated.
+      - name: Dispatch CI on the release PR branch
+        if: steps.release.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # Step env is evaluated even when the step is skipped; outputs.pr is
+          # empty when no release PR exists, and fromJSON('') errors.
+          RELEASE_BRANCH: ${{ fromJSON(steps.release.outputs.pr || '{}').headBranchName }}
+        run: |
+          if ! gh workflow run ci.yml --ref "$RELEASE_BRANCH"; then
+            echo "::error title=CI dispatch failed::Could not dispatch ci.yml on $RELEASE_BRANCH. Check that ci.yml lists 'workflow_dispatch:' under 'on:'."
+            exit 1
+          fi
+          echo "Dispatched ci.yml on $RELEASE_BRANCH"
